@@ -1,0 +1,1 @@
+from .centroid_distance import get_base_vec_centroid_dist  # back-compat re-export

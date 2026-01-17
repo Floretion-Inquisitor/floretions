@@ -1,17 +1,13 @@
 # MIT License
-
-# Copyright (c) [2023 [Creighton Dement]
-
+# Copyright (c) [2025 [Creighton Dement]
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
 # in the Software without restriction, including without limitation the rights
 # to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
-
 # The above copyright notice and this permission notice shall be included in all
 # copies or substantial portions of the Software.
-
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -20,428 +16,195 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
+from typing import Tuple, Optional
+import math
+
 import cv2
 import numpy as np
-import os
-import colorsys
-import time
 
 from floretion import Floretion
 
 
+
+
+
+
+from lib.triangleize_utils.coloring import (
+    ColorMode,
+    choose_max_val_for_colors,
+    map_color,
+    NegPolicy
+)
+
+
+
 class Triangleize:
     """
-    A class to represent the Sierpinski structure based on floretion mathematics.
-
-    Attributes:
-        floretion (Floretion): An instance of the Floretion class.
-        base_vectors (list): A list of octal strings representing base vectors.
-        coeffs (list): A list of coefficients for each base vector.
-        img (ndarray): The image to be plotted on.
-        plot_type (str): The type of plot ('dot' or 'triangle').
-        height (int): The height of the image.
-        width (int): The width of the image.
-        distance_scale_fac (int): The scaling factor for distances in the image.
+    Rappresentazione Sierpinski-based con triangoli o punti.
     """
 
-    def __init__(self, floretion_object, image, plot_type='dot', distance_scale_fac=4):
-        """
-               Initializes an instance of the SierpinskiFlo class.
-
-               Args:
-                   floretion_object (Floretion): An instance of the Floretion class.
-                   image (ndarray): The image to be plotted on.
-                   plot_type (str, optional): The type of plot ('dot' or 'triangle'). Defaults to 'dot'.
-                   distance_scale_fac (int, optional): The scaling factor for distances in the image. Defaults to 4.
-        """
+    def __init__(self, floretion_object: Floretion, image: np.ndarray, plot_type: str = "triangle", distance_scale_fac: float = 4.0):
         self.floretion = floretion_object
-        self.flo_order = self.floretion.flo_order
-        self.base_vectors = self.floretion.grid_flo_loaded_data['oct']
+        self.base_vectors = self.floretion.grid_flo_loaded_data["oct"]
         self.coeffs = self.floretion.coeff_vec_all
-        self.max_coeff = np.absolute(self.coeffs).max()
+
         self.img = image
         self.plot_type = plot_type
         self.height, self.width = self.img.shape[0], self.img.shape[1]
-        self.distance_scale_fac = distance_scale_fac
+        self.distance_scale_fac = float(distance_scale_fac)
 
-    def draw_dot(self, x, y, brightness, color):
-        """
-          Draws a dot at the specified coordinates with the given brightness and color.
-
-          Args:
-              x (int): The x-coordinate.
-              y (int): The y-coordinate.
-              brightness (float): The brightness level [0, 1].
-              color (tuple): The BGR color.
-        """
-
-        # Scale each component of the color
-        scaled_color = tuple(int(c * brightness) for c in color)
-
-        # Radius is a placeholder; you can change this
-        radius = 1
-
-        # Draw the dot using OpenCV's circle function
+    def draw_dot(self, x: float, y: float, brightness: float, color_bgr: Tuple[int, int, int]) -> None:
+        scaled_color = tuple(int(max(0, min(255, c * brightness))) for c in color_bgr)
+        radius = max(1, int(self.height * 0.003))
         cv2.circle(self.img, (int(x), int(y)), radius, scaled_color, -1)
 
-    def draw_triangle(self, x, y, height, orientation, color):
-        """
-          Draws a dot at the specified coordinates with the given brightness and color.
-
-          Args:
-              x (int): The x-coordinate.
-              y (int): The y-coordinate.
-              height: height of equilateral triangle
-              orientation: whether to draw triangle facing upwards or downwards
-              color (tuple): The BGR color.
-          """
-        # calculate the vertices of the equilateral triangle
-        half_base = np.sin(np.pi / 3) * height
-        if orientation == 'up':
-            vertices = np.array([[x, y - height], [x - half_base, y + height / 2], [x + half_base, y + height / 2]],
-                                np.int32)
-        else:  # down
-            vertices = np.array([[x, y + height], [x - half_base, y - height / 2], [x + half_base, y - height / 2]],
-                                np.int32)
-        vertices = vertices.reshape((-1, 1, 2))
-
-        # color and brightness are placeholders; you can replace these based on your needs
-        # color = (255, 255, 255)  # White
-        # tuple(int(c * brightness) for c in color)
-
-        # color_with_alpha = tuple(color[0], color[1], color[2], 255)
-        # cv2.circle(self.img, (int(x), int(y)), int(r), color_with_alpha, -1)
-        color = (int(color[0]), int(color[1]), int(color[2]))
-        # print(color)
-        cv2.fillConvexPoly(self.img, vertices, color)
+    def draw_triangle(self, x: float, y: float, height: float, orientation: str, brightness: float, color_bgr: Tuple[int, int, int]) -> None:
+        half_base = math.sin(math.pi / 3.0) * height
+        if orientation == "up":
+            vertices = np.array([[x, y - height], [x - half_base, y + height / 2.0], [x + half_base, y + height / 2.0]], dtype=np.int32)
+        else:
+            vertices = np.array([[x, y + height], [x - half_base, y - height / 2.0], [x + half_base, y - height / 2.0]], dtype=np.int32)
+        scaled_color = tuple(int(max(0, min(255, c * brightness))) for c in color_bgr)
+        cv2.fillConvexPoly(self.img, vertices.reshape((-1, 1, 2)), scaled_color)
 
     @staticmethod
-    def calculate_orientation(base_vector):
+    def calculate_orientation(base_vector_oct: str) -> str:
+        count = sum(1 for d in base_vector_oct if d in "124")
+        order = len(base_vector_oct)
+        if count % 2 == 0:
+            return "up" if order % 2 == 0 else "down"
+        return "down" if order % 2 == 0 else "up"
+
+    def place_base_vecs(self, base_vector_oct: str) -> Tuple[float, float, float, float, float, np.ndarray]:
+        x = self.width // 2
+        y = self.height // 2
+        y += int(self.height * 0.1)
+
+        distance = self.height / self.distance_scale_fac
+        x_theo = 0.0
+        y_theo = 0.0
+        sign_distance = -1.0
+
+        green_value = red_value = blue_value = 0
+
+        for digit in base_vector_oct:
+            if digit == "7":
+                sign_distance *= -1.0
+            else:
+                if digit == "4":
+                    angle = 210
+                elif digit == "2":
+                    angle = 90
+                elif digit == "1":
+                    angle = 330
+                else:
+                    raise ValueError(f"Cifra ottale non valida: {digit}")
+
+                dx = math.cos(math.radians(angle)) * distance * sign_distance
+                dy = math.sin(math.radians(angle)) * distance * sign_distance
+                x += dx
+                y += dy
+                x_theo += dx
+                y_theo += dy
+
+            green_distance = math.hypot(x - 0.0, y - 0.0)
+            red_distance = math.hypot(x - float(self.width), y - 0.0)
+            blue_distance = math.hypot(x - float(self.width) / 2.0, y - float(self.height))
+
+            max_distance = math.hypot(float(self.height), float(self.width))
+            green_value = int((green_distance / max_distance) * 255.0)
+            red_value = int((red_distance / max_distance) * 255.0)
+            blue_value = int((blue_distance / max_distance) * 255.0)
+
+            distance /= 2.0
+
+        color_array = np.array([red_value, green_value, blue_value], dtype=np.int32)
+        return x, y, x_theo, y_theo, 1.3 * distance, color_array
+
+    def plot_floretion(
+            self,
+            title: Optional[str] = None,
+            highlight_base_vec: Optional[int] = None,
+            *,
+            color_mode: ColorMode = "abs-hsv",
+            max_val: Optional[float] = None,  # se vuoi assumere “2” metti default=2.0
+            auto_clip_pct: float = 99.0,
+            gamma: float = 0.6,
+            sat_dist_weight: float = 0.5,
+            neg_policy: NegPolicy = "hue-180",
+            band_count: int = 8,
+    ) -> None:
         """
-        Calculates the orientation of a triangle based on its associated base vector.
-
-        Args:
-            base_vector (str): The base vector of the floretion in octal representation.
-
-        Returns:
-            str: The orientation ('up' or 'down').
+        Colori robusti per coefficienti grandi, delega a lib.triangleize_utils.coloring.
         """
-        octal_str = base_vector
-        count = 0
-        # Instead of counting parity of the digits below, we could test if (base_vector)^2 = +1 or -1,
-        # which seems more elegant mathematically but is probably not as fast computationally in current code
-        for digit in octal_str:
-            if digit in '124':
-                count += 1
-
-        # Determine the order of the floretion
-        order = len(octal_str)
-
-        # Check the orientation based on the count and the order
-        if count % 2 == 0:  # x^2 = 1
-            orientation = 'up' if order % 2 == 0 else 'down'
-        else:  # x^2 = -1
-            orientation = 'down' if order % 2 == 0 else 'up'
-
-        return orientation
-
-    def plot_floretion(self, title=None, highlight_base_vec=None):
-        """
-        Plots the floretion using either dots or triangles based on the plot type.
-        """
-
-        # Add the title to the image if provided
         if title:
             cv2.putText(self.img, title, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 5)
 
+        # Valore massimo “robusto”
+        max_val_eff = choose_max_val_for_colors(self.floretion.coeff_vec_all, max_val, auto_clip_pct)
+
+        num_basevecs = float(len(self.floretion.coeff_vec_all))
+        index = 0
+
         for base_vector, coeff in zip(self.base_vectors, self.floretion.coeff_vec_all):
-            x, y, final_distance, color = self.place_base_vecs(str(base_vector), coeff)
-            brightness = abs(coeff)
-            abs_mean = 2.0 * abs(np.mean(coeff))
-            if coeff > 0:
-                pass
-                # color[0] = abs_mean*color[2]
+            x, y, x_theo, y_theo, final_distance, _ = self.place_base_vecs(str(base_vector))
 
-                # color[1] = 0
-                # color[2] = 255
-                # place_holder = color[0]
-                # color[0] = color[1]
-                # color[1] = color[2]
-                # color[2] = place_holder
+            basevec_at_pct = index / (num_basevecs - 1.0) if num_basevecs > 1 else 0.0
+            dist_norm = math.hypot(x_theo, y_theo) / max(1.0, float(self.height))
+
+            color, brightness01 = map_color(
+                coeff=float(coeff),
+                basevec_at_pct=basevec_at_pct,
+                dist_norm=dist_norm,
+                max_val=max_val_eff,
+                mode=color_mode,
+                gamma=gamma,
+                sat_dist_weight=sat_dist_weight,
+                neg_policy=neg_policy,
+                band_count=band_count,
+            )
+
+            if highlight_base_vec is not None and int(base_vector) == int(highlight_base_vec):
+                color = (255, 255, 255)
+                brightness01 = 1.0
+
+            orientation = self.calculate_orientation(str(base_vector))
+
+            if self.plot_type in ("dot", "dots"):
+                self.draw_dot(x, y, brightness01, color)
+            elif self.plot_type in ("triangle", "triangles"):
+                self.draw_triangle(x, y, final_distance, orientation, brightness01, color)
             else:
-                # color[0] = 255
-                # color[1] = 0
+                raise ValueError(f"Unknown plottype {self.plot_type}")
 
-                # color[2] = abs_mean*color[2]
-                pass
-                # color[2] = 0
-                # color[1] = 0
-                # color[2] = 0
-
-            if brightness < .1:
-                brightness = .1
-
-            orientation = self.calculate_orientation(base_vector)
-            # print(f" base_vector = {base_vector}, highlight_base_vec = {highlight_base_vec}")
-
-            # If the current base vector is the one to highlight, set its color to white
-            is_highlight_base_vec = False
-            if base_vector == highlight_base_vec:
-                is_highlight_base_vec = True
-                # print(f" Full brightness for base_vector = {base_vector} = highlight_base_vec = {highlight_base_vec}")
-                color = (255, 255, 255)  # White color
-                brightness = 1  # Full brightness
-
-            if self.plot_type == 'dot' or self.plot_type == 'dots':
-                self.draw_dot(x, y, brightness, color)
-            elif self.plot_type == 'triangle' or self.plot_type == 'triangles':
-                self.draw_triangle(x, y, final_distance, orientation, color)
-                # Add the octal representation on top of the triangle
-                # cv2.putText(self.img, str(base_vector), (int(x)-20, int(y)+0), cv2.FONT_HERSHEY_SIMPLEX, 1,  (255, 255, 255), 2)
-                if is_highlight_base_vec:
-                    pass
-                    # cv2.putText(self.img, str(base_vector), (int(x) - 10, int(y) + 0), cv2.FONT_HERSHEY_SIMPLEX, .3, (0, 0, 0), 1)
-            # cv2.putText(self.img, str(base_vector), (int(x)-30, int(y)+5), cv2.FONT_HERSHEY_PLAIN, .5, (255, 255, 255), 2)
-            else:
-                print(f"Unknown plottype {self.plot_type}")
-
-    # ax.text(x, y, label, fontsize=12)
-
-    def place_base_vecs(self, base_vector, coeff):
-        """
-        Main algorithm to associate a base vector with the centroid of an equilateral triangle. If base vector is of
-        order n, then this equilateral triangle can be seen as one of 4^n "tiles" inside of a surrounding equilateral triangle.
-        The colors (hue, saturation and brightness) can be changed without altering the actual algorithm.
-        """
-
-        x, y = self.height // 2, self.width // 2
-        y_offset = int(self.height * 0.1)
-        y += y_offset
-
-        distance = self.height // self.distance_scale_fac
-        sign_distance = -1
-
-        # Initialize base hue, and set increments for hue adjustment
-
-        color_hue = []
-        color_sat = []
-
-        for digit in base_vector:
-            # digit 4 should be at 330 and digit 1 at 210, i.e. 1 and 4 should be reversed,
-            # but writing the other away around here prevents us from having to call flip
-            if digit == '7':
-                sign_distance *= -1
-                color_hue.append(np.nan)
-            else:
-                if digit == '4':
-                    angle = 210
-
-                elif digit == '2':
-                    angle = 90
-
-                elif digit == '1':
-                    angle = 330
-                else:
-                    print(f"Invalid digit {digit}")
-                    return
-
-                if sign_distance == -1:
-                    color_hue.append(360 - angle)
-                else:
-                    color_hue.append(360 - angle)
-
-                x += np.cos(np.radians(angle)) * distance * sign_distance
-                y += np.sin(np.radians(angle)) * distance * sign_distance
-
-            distance /= 2
-            color_sat.append(distance)
-
-        # Saturation and Brightness (Value)
-        changed_dir_count = np.count_nonzero(np.isnan(color_hue))
-        if changed_dir_count > 15:
-            saturation = abs(np.log(changed_dir_count))
-        else:
-            saturation = 1.0
-
-        if self.max_coeff > 0:
-            brightness = abs(coeff) / self.max_coeff
-        else:
-            brightness = 0
-
-        processed_hue = np.array(color_hue)
-        processed_sat = np.array(color_sat)
-        max_sat = processed_sat.max()
-        processed_sat = processed_sat / max_sat
-        processed_hue = np.nansum(processed_hue * processed_sat)
-
-        # Convert HSV to RGB
-        rgb = colorsys.hsv_to_rgb(processed_hue, saturation, brightness)
-        color_array = (np.array(rgb) * 255).astype(int)
+            index += 1
 
 
-        return x, y, 1.8 * distance, color_array
-
-
-def decimal_to_octal(decimal):
-    return format(int(decimal), 'o')
-
+# Demo veloce eseguibile direttamente
 
 if __name__ == "__main__":
 
-    # print(colorsys.rgb_to_hsv(0, 0, 255))
-    # exit(-1)
-    height, width = 4 * 1024, 4 * 1024
+    W, H = 2024, 2024
+    from lib.triangleize_utils.ripples import render_radial_ripples_sequence
+    from lib.triangleize_utils.centroid_distance import flo_from_centroid_distance
 
-    flo_order = 5
-    zero_flo = Floretion.from_string(f'0{"e" * flo_order}')
-    unit_flo = Floretion.from_string(f'1{"e" * flo_order}')
-
-    # tests
-    #flo_x = Floretion.from_string('1i+2j+3k+4e')
-    #flo_y = Floretion.from_string('k-j+3')
-    flo_x = Floretion.from_string('1ii-3ij +2jk - 4ie')
-    flo_y = Floretion.from_string('6ii-  4ie + kk')
-    print((flo_x*flo_y).as_floretion_notation())
-
-
-    new_coeffs_sierp = []
-    new_coeffs_sierp_i = []
-    new_coeffs_sierp_j = []
-    new_coeffs_sierp_k = []
-
-    for base in zero_flo.base_vec_dec_all:
-
-        print(f'dto {decimal_to_octal(base)}')
-        if '7' in decimal_to_octal(base):
-            new_coeffs_sierp.append(0.0)
-        else:
-            new_coeffs_sierp.append(1.0)
-
-        if '1' in decimal_to_octal(base):
-            new_coeffs_sierp_i.append(0.0)
-        else:
-            new_coeffs_sierp_i.append(1.0)
-
-        if '2' in decimal_to_octal(base):
-            new_coeffs_sierp_j.append(0.0)
-        else:
-            new_coeffs_sierp_j.append(1.0)
-
-        if '4' in decimal_to_octal(base):
-            new_coeffs_sierp_k.append(0.0)
-        else:
-            new_coeffs_sierp_k.append(1.0)
-
-    new_coeffs_sierp = np.array(new_coeffs_sierp)
-    new_coeffs_sierp_i = np.array(new_coeffs_sierp_i)
-    new_coeffs_sierp_j = np.array(new_coeffs_sierp_j)
-    new_coeffs_sierp_k = np.array(new_coeffs_sierp_k)
-
-    norm_fac = (np.sqrt((1 / 3)) ** (flo_order))
-    sierp_flo = Floretion(norm_fac * new_coeffs_sierp, zero_flo.base_vec_dec_all, format_type="dec")
-    sierp_flo_i = Floretion(norm_fac * new_coeffs_sierp_i, zero_flo.base_vec_dec_all, format_type="dec")
-    sierp_flo_j = Floretion(norm_fac * new_coeffs_sierp_j, zero_flo.base_vec_dec_all, format_type="dec")
-    sierp_flo_k = Floretion(norm_fac * new_coeffs_sierp_k, zero_flo.base_vec_dec_all, format_type="dec")
-
-    # Initialize VideoWriter
-    # fourcc = cv2.VideoWriter_fourcc(*'mp4v') # FourCC code for MP4
-    # out = cv2.VideoWriter('sierpinski_animation.mp4', fourcc, 30, (width, height))
-
-    # out.write(img_t)
-
-    # Release the VideoWriter
-    # out.release()
-
-    # Optional: Release any additional OpenCV objects
-    # cv2.destroyAllWindows()
-
-    # floretion_instance = Floretion.from_string(".2ii+ij+ik+ie+ei+ej+ek+ee+ji+jj+jk+je+ki+kj+kk+ke")
+    order = 7
+    #seed = flo_from_centroid_distance(order=order, pct=100, relation="le", coeff="dist")
+    seed = Floretion.get_typical_floretions("sierp_flo", order)
+    out_dir, frames = render_radial_ripples_sequence(
+        width=W, height=H,
+        order=order, total_frames=1200,
+        seed=seed,
+        wavelength_pct=8.0,
+        speed_pct_per_frame=0.1,
+        amplitude=0.8, bias=0.2, phase0=0.0, damping_alpha=0.5,
+        mix="mul",
+        normalize_to=2.0,
+        color_mode="log-hsv",  # oppure "legacy" per il look classico
+        output_dirname="yeah_baby_now"
+    )
+    print("frames in:", out_dir)
 
 
-
-    centers_data_pos = Floretion.load_centers(flo_order, decomposition_type="pos")
-    centers_data_neg = Floretion.load_centers(flo_order, decomposition_type="neg")
-    grid_flo_loaded_data_all = zero_flo.grid_flo_loaded_data
-
-    filename = "test_time"
-    filedir = f"./data/triangleize/{filename}_{flo_order}"
-    if not os.path.exists(filedir):
-        os.makedirs(filedir)
-
-    flo_index = 0
-    flo_to_map = sierp_flo
-    start_time = time.time()  # Start timing
-    for flo in centers_data_neg.keys():
-
-        coeff_array = np.ones(len(centers_data_pos))
-        flo_to_pos = Floretion(coeff_array, np.array(centers_data_pos[flo]))
-        flo_to_neg = Floretion(coeff_array, np.array(centers_data_neg[flo]))
-        img = np.zeros((height, width, 3), np.uint8)
-
-        #flo_to_map = flo_to_pos * flo_to_map * flo_to_neg
-        flo_to_map = flo_to_neg * flo_to_map * flo_to_neg
-        if flo_index % 3 == 0:
-            flo_to_map = flo_to_map * sierp_flo_i
-        elif flo_index % 3 == 1:
-            flo_to_map = flo_to_map * sierp_flo_j
-        elif flo_index % 3 == 2:
-            flo_to_map = flo_to_map * sierp_flo_k
-
-        #flo_to_map = flo_to_map * flo_to_map
-
-        flo_to_map = Floretion.normalize_coeffs(flo_to_map, 4)
-        print(flo_to_map.as_floretion_notation())
-        floA = Triangleize(flo_to_map, img, plot_type='triangle')
-        floA.plot_floretion()
-        flo_index += 1
-
-        png_filename = filedir + f"/{format(int(flo), 'o')}.png"
-        cv2.imwrite(png_filename, img)
-
-        saved_flo_filename = filedir + f"/{filename}.saved_flos.txt"
-        if flo_index % 256 == 0:
-            print("Saving to file")
-            with open(saved_flo_filename, "a") as myfile:
-                myfile.write(f'{flo}: {flo_to_map.as_floretion_notation()}')
-
-
-
-    end_time = time.time()  # End timing
-
-
-    print("Execution Time:", end_time - start_time, "seconds")
-    exit(-1)
-    tes_index = 0
-    for tes_scalar in np.arange(0, 2, .1):
-        coeff_array[-10:-1] = 1
-        print(coeff_array)
-
-        print(flo_to_pos.as_floretion_notation())
-
-        # flo_to_neg = Floretion(np.ones(len(centers_data_neg[flo])), np.array(centers_data_neg[flo]))
-        # flo_to_map = flo_to_pos*flo_to_neg
-
-        # identities
-        # sierp_flo_i * sierp_flo_k = j
-        # sierp_flo_j * sierp_flo_i = k
-        # sierp_flo_k * sierp_flo_j = i
-        flo_to_map = flo_to_pos
-        # flo_to_map = flo_to_map*flo_to_map
-        print(flo_to_map.as_floretion_notation())
-
-        floA = Triangleize(flo_to_map, img, plot_type='triangle')
-        floA.plot_floretion()
-        filename = filedir + f"/{format(int(flo), 'o')}.tes_{'{:05.0f}'.format(tes_index)}.png"
-
-
-        tes_index += 1
-        cv2.imwrite(filename, img)
-
-    flo_index += 1
-
-# imgA = np.zeros((height, width, 3), np.uint8)
-# floA = Floretion.normalize_coeffs(this_flo, 1)
-
-
-# cv2.waitKey(0)
-# cv2.destroyAllWindows()

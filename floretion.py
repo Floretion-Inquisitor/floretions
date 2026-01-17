@@ -1,1088 +1,850 @@
-# MIT License
+from __future__ import annotations
 
-# Copyright (c) [2024 [Creighton Dement]
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
+from typing import Dict, Iterable, List, Mapping, Sequence
+import re
+import logging
 
 import numpy as np
 import pandas as pd
-import re
-import os
-import json
-from multiprocessing import Pool, cpu_count
-import floretion_base_vector
-import logging
-import time
 
-logger = logging.getLogger('FloretionLogger')
+# Logger di modulo
+logger = logging.getLogger(__name__)
 
-# Set the level of the logger. This can be DEBUG, INFO, WARNING, ERROR, or CRITICAL.
-logger.setLevel(logging.INFO)
+# Utility di bit e path (lib esterna)
+from lib.floretion_utils.bitops import _bitmask, _oct666, _oct111, sgn
+from lib.floretion_utils.config_paths import (
+    get_grid_csv,
+    data_dir,
+    get_mult_strategy,
+    iter_npy_segments,
+    parse_segment_num,
+    expected_layout_summary,
+)
 
-# Create handlers
-c_handler = logging.StreamHandler()
-f_handler = logging.FileHandler('floretion.log')
-
-# Set levels for handlers
-c_handler.setLevel(logging.INFO)
-f_handler.setLevel(logging.ERROR)
-
-# Create formatters and add it to handlers
-c_format = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
-f_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-c_handler.setFormatter(c_format)
-f_handler.setFormatter(f_format)
-
-# Add handlers to the logger
-logger.addHandler(c_handler)
-logger.addHandler(f_handler)
-
-# Constants
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FLORETION_VERSION = 1.01
-DEFAULT_PROCESS_COUNT = max(2, (3 * cpu_count() // 4) // 2 * 2)
+# Operazioni esterne (lib): wrapper statici sotto
+from lib.floretion_utils.floretion_ops import (
+    normalize_coeffs as _normalize_coeffs,
+    fractional_coeffs as _fractional_coeffs,
+    mirror as _mirror,
+    split_by_leading_symbol as _split_by_leading_symbol,
+    cyc as _cyc,
+    tri as _tri,
+    strip_flo as _strip_flo,
+    grow_flo as _grow_flo,
+    proj as _proj,
+    proj_strip_grow as _proj_strip_grow,
+    get_typical_floretions as _get_typical_floretions,
+    rotate_coeffs as _rotate_coeffs,
+    apply_sequence as _apply_sequence,
+    square_fast as _square_fast_alias,   # resta qui
+)
 
 
-def count_bits(n):
-    """Count the number of '1's in the binary representation of an integer."""
-    return bin(n).count('1')
 
+# Sostituisci la parte “centers” in cima a floretion.py
 
-def sgn(x):
-    """Return the sign of a number: -1 for negative, 1 for non-negative."""
-    return -1 if x < 0 else 1
+# floretion.py — sostituisci SOLO la parte che importava/esponeva i centers
+from lib.floretion_utils.floretion_centers import (
+    write_centers_to_file as _write_centers_to_file,
+    load_centers as _load_centers,
+    load_centers_map as _load_centers_map,
+    load_centers_for_base as _load_centers_for_base,
+    find_center as _find_center,
+    find_center_base_vectors_only as _find_center_base_vectors_only,
+)
 
 
 class Floretion:
     """
-    Represents a Floretion (see ) with base vectors defined in octal format
-    using digits from {1, 2, 4, 7}. These base vectors represent the group of all floretions of order n,
-    where each floretion uses XOR for multiplication. Data about the floretion group is imported from
-    'floretions/data', f"grid.flo_{self.flo_order}.oct.csv" upon initialization.
-
-    Examples:
-        - First Order Floretion (Quaternion):
-          flo_x = Floretion.from_string('1i+2j+3k+4e')
-          flo_y = Floretion.from_string('k-j+3')
-          flo_z = 2 * flo_x * flo_y
-
-        - Third Order Floretion:
-          flo_x = Floretion.from_string('1iii-3iji +2jkj - 4iee')
-          flo_y = Floretion.from_string('6iijk- 4ieek + kkke')
-          flo_z = flo_x * flo_y + 2 * flo_y
-
-        - Direct Initialization with Arrays:
-          flo_x = Floretion([1, 0.5, -0.2, 3], [11, 21, 41, 77], format_type="oct")
-          # use as_floretion_notation() on any floretion for printing in floretion notation
-          flo_x.as_floretion_notation() -> "ii + .5ji - 0.2ki + 3ee"
-
-          commutes_ie = np.array([9, 10, 12, 15, 57, 58, 60, 63])
-          flo_commutes_ie = Floretion(np.ones(commutes_ie.size), commutes_ie, format_type="dec")
-          print(f"flo_commutes_ie {flo_commutes_ie.as_floretion_notation()}")
-
-    Attributes:
-        base_to_nonzero_coeff (dict): Mapping of base vectors (in decimal) to their non-zero coefficients.
-        format_type (str): Format of base vectors ('dec' or 'oct').
-        max_order (int): Maximum order for the floretions.
-        flo_order (int): Current order of the floretion.
-        grid_flo_loaded_data (DataFrame): Pre-loaded data.
-        base_vec_dec_all (np.array): Array of all base vectors in decimal.
-        coeff_vec_all (np.array): Array of coefficients aligned with `base_vec_dec_all`.
-        base_to_grid_index (dict): Mapping of base vectors to their grid indices.
+    Rappresenta una Floretion con base vectors (in decimale) che in ottale usano solo cifre {1,2,4,7}.
+    La moltiplicazione dei vettori base segue regole bitwise (XNOR/AND) equivalenti al caso quaternioni per ordine 1.
     """
-    num_processes = DEFAULT_PROCESS_COUNT
 
-    def __init__(self, coeffs_of_base_vecs, base_vecs, grid_flo_loaded_data=None, format_type="dec"):
-        """
-        Initializes a Floretion instance with given coefficients and base vectors, with optional pre-loaded data.
-        Parameters:
-            coeffs_of_base_vecs (list): Coefficients of the base vectors.
-            base_vecs (list): Base vectors corresponding to the coefficients.
-            grid_flo_loaded_data (DataFrame): Optional pre-loaded data, defaults to None.
-            format_type (str): Indicates the format of base vectors ('dec' or 'oct'), defaults to 'dec'.
-        """
+    num_processes: int = 2  # placeholder, non usato qui
+
+    def __init__(
+        self,
+        coeffs_of_base_vecs: Sequence[float],
+        base_vecs: Sequence[int],
+        grid_flo_loaded_data: pd.DataFrame | None = None,
+        format_type: str = "dec",
+    ) -> None:
         self.format_type = format_type
-        temp_base_vec_dec = np.array([int(str(bv), 8) if format_type == "oct" else bv for bv in base_vecs])
-        self.base_to_nonzero_coeff = {bv: coeff for bv, coeff in zip(temp_base_vec_dec, coeffs_of_base_vecs) if
-                                      np.abs(coeff) > np.finfo(float).eps}
-        # define maximum order of floretions for which base vectors are defined in input data
-        self.max_order = 10
-        self.flo_order = self.find_flo_order(temp_base_vec_dec, self.max_order)
+        temp_base_vec_dec = np.array(
+            [int(str(bv), 8) if format_type == "oct" else int(bv) for bv in base_vecs]
+        )
+
+        # coefficienti non nulli
+        self.base_to_nonzero_coeff: Dict[int, float] = {
+            int(bv): float(coeff)
+            for bv, coeff in zip(temp_base_vec_dec, coeffs_of_base_vecs)
+            if abs(float(coeff)) > np.finfo(float).eps
+        }
+
+        # ordine (limite max fisso per ora)
+        self.max_order: int = 10
+        self.flo_order: int = self.find_flo_order(temp_base_vec_dec, self.max_order)
         self.load_floretion_data(grid_flo_loaded_data)
 
-    def load_floretion_data(self, grid_flo_loaded_data):
-        """Load floretion data from file or use provided DataFrame."""
-        file_path = os.path.join(BASE_DIR, 'floretions/data', f"grid.flo_{self.flo_order}.oct.csv")
+    # ---------------------------------------------------------------------
+    # Caricamento dati griglia
+    # ---------------------------------------------------------------------
+    def load_floretion_data(self, grid_flo_loaded_data: pd.DataFrame | None) -> None:
+        file_path = get_grid_csv(self.flo_order)
         if grid_flo_loaded_data is None:
             try:
-                self.grid_flo_loaded_data = pd.read_csv(file_path, dtype={'oct': str})
-            except FileNotFoundError:
-                logging.error(f"The file {file_path} could not be found.")
-                raise
+                self.grid_flo_loaded_data = pd.read_csv(file_path, dtype={"oct": str})
+            except FileNotFoundError as e:
+                logger.error("=== ERRORE: file griglia non trovato ===")
+                logger.error("Tentato: %s", file_path)
+                logger.error(expected_layout_summary(self.flo_order))
+                logger.error("========================================")
+                raise FileNotFoundError(
+                    f"Griglia mancante per ordine {self.flo_order}: {file_path}. "
+                    f"Consulta la struttura attesa nel log."
+                ) from e
         else:
             self.grid_flo_loaded_data = grid_flo_loaded_data
 
-        self.base_vec_dec_all = self.grid_flo_loaded_data['floretion'].to_numpy()
+        self.base_vec_dec_all = self.grid_flo_loaded_data["floretion"].to_numpy()
         self.coeff_vec_all = np.zeros_like(self.base_vec_dec_all, dtype=float)
         self.map_coeffs_to_base_vectors()
 
-    def map_coeffs_to_base_vectors(self):
-        """Map coefficients to base vectors using the pre-loaded grid data."""
-        self.base_to_grid_index = {base_vec: idx for idx, base_vec in enumerate(self.base_vec_dec_all) if
-                                   base_vec in self.base_to_nonzero_coeff}
+
+
+    def map_coeffs_to_base_vectors(self) -> None:
+        """Mappa i coefficienti non nulli sugli indici della griglia.
+
+        Crea:
+        - self.index_by_val: mappa TUTTI i base vectors della griglia → indice (0..N-1)
+        - self.base_to_grid_index: solo i base vectors con coefficiente non nullo in questa istanza.
+        """
+        # mappa globale: ogni valore di base_vec_dec_all → indice
+        self.index_by_val: Dict[int, int] = {
+            int(v): int(i) for i, v in enumerate(self.base_vec_dec_all)
+        }
+
+        # mappa solo per i vettori effettivamente presenti (coeff ≠ 0)
+        self.base_to_grid_index: Dict[int, int] = {}
+
         for base_vec, coeff in self.base_to_nonzero_coeff.items():
-            idx = self.base_to_grid_index.get(base_vec)
-            if idx is not None:
-                self.coeff_vec_all[idx] = coeff
-            else:
-                logging.warning(f"Base vector {base_vec} not found in grid.")
+            idx = self.index_by_val.get(int(base_vec))
+            if idx is None:
+                raise ValueError(
+                    f"floretion->map_coeffs_to_base_vectors->index for base_vec {base_vec} not found!"
+                )
+            self.base_to_grid_index[base_vec] = idx
+            self.coeff_vec_all[idx] = coeff
 
+    # ---------------------------------------------------------------------
+    # Costruzione da stringa
+    # ---------------------------------------------------------------------
     @classmethod
-    def from_preloaded_data(cls, coeffs_of_base_vecs, base_vecs, flo_order, grid_flo_data):
-        """
-        Creates a Floretion instance from pre-loaded data.
+    def from_string(cls, flo_string: str, format_type: str = "dec") -> "Floretion":
+        flo_string = flo_string.replace(" ", "")
+        if not all(c in "0123456789ijke.+-()" for c in flo_string):
+            raise ValueError("Carattere non valido. Esempio ordine 3: 3.5iii + jjk - 0.5eee")
+        if any(s in flo_string for s in ("++", "+-", "-+", "--")):
+            raise ValueError("Segni consecutivi non validi.")
 
-        Parameters:
-            coeffs_of_base_vecs: A list of coefficients.
-            base_vecs: A list of base vectors.
-            flo_order: The floretion order.
-            grid_flo_data: A Pandas DataFrame of grid data.
+        terms_str = re.findall(r"[\+\-]?[0-9]*\.?[0-9]*[ijke]+", flo_string)
+        coeffs: List[float] = []
+        base_vecs: List[int] = []
 
-        Returns:
-            A new Floretion instance.
-        """
-        if len(base_vecs) != len(grid_flo_data):
-            raise ValueError(
-                f"The length of base_vecs {len(base_vecs)} must match the number of rows in grid_flo_data {len(grid_flo_data)}.")
+        for term in terms_str:
+            m = re.match(r"([\+\-]?[0-9]*\.?[0-9]*)?([ijke]+)", term)
+            if not m:
+                raise ValueError(f"Termine non valido: {term}")
+            coeff_str, base_vec_str = m.groups()
+            if coeff_str in (None, "", "+"):
+                coeff = 1.0
+            elif coeff_str == "-":
+                coeff = -1.0
+            else:
+                coeff = float(coeff_str)
 
-        instance = cls.__new__(cls)
+            base_val = 0
+            for ch in base_vec_str:
+                base_val = (base_val << 3) | (1 if ch == "i" else 2 if ch == "j" else 4 if ch == "k" else 7)
+            coeffs.append(coeff)
+            base_vecs.append(base_val)
 
-        # Assuming base_vecs and coeffs are non-zero and properly aligned
-        instance.base_to_nonzero_coeff = dict(zip(base_vecs, coeffs_of_base_vecs))
-        instance.flo_order = flo_order
-        instance.grid_flo_loaded_data = grid_flo_data
-        instance.base_vec_dec_all = np.array(base_vecs)
-        instance.coeff_vec_all = np.array(coeffs_of_base_vecs)
+        return cls(coeffs_of_base_vecs=np.array(coeffs), base_vecs=np.array(base_vecs), format_type=format_type)
 
-        # base_to_grid_index can be directly computed if base_vec_dec_all and base_to_nonzero_coeff are the same
-        instance.base_to_grid_index = {}
-        for base_vec in base_vecs:
-            index_row = grid_flo_data[grid_flo_data['floretion'] == base_vec].index[0]
-            instance.base_to_grid_index[base_vec] = index_row
-
-        return instance
-
-    def find_flo_order(self, temp_base_vec_dec, max_order):
-        """
-        Determines the order of the floretion.
-
-        Parameters
-        ----------
-        temp_base_vec_dec : np.array
-            An array of base vectors in decimal representation.
-        max_order : int
-            The maximum order to be considered.
-
-        Returns
-        -------
-        int
-            The order of the floretion.
-        """
+    # ---------------------------------------------------------------------
+    # Proprietà ordine
+    # ---------------------------------------------------------------------
+    def find_flo_order(self, temp_base_vec_dec: np.ndarray, max_order: int) -> int:
         common_order = -1
         for base_element in temp_base_vec_dec:
             flo_order = 0
             found_order = False
             while flo_order <= max_order and not found_order:
                 flo_order += 1
-                if base_element <= (8 ** flo_order) - 1:
+                if base_element <= (8**flo_order) - 1:
                     found_order = True
-
             if common_order == -1:
                 common_order = flo_order
             elif common_order != flo_order:
-                raise ValueError("All base vectors must have the same order")
-
+                raise ValueError("Tutti i base vectors devono avere lo stesso ordine")
         return common_order
 
-    def __pow__(self, exponent):
+    # ---------------------------------------------------------------------
+    # Operatori
+    # ---------------------------------------------------------------------
+    def __pow__(self, exponent: int) -> "Floretion":
+        if exponent < 0:
+            raise ValueError("L'esponente deve essere >= 0")
         if exponent == 0:
-            return Floretion(1)  # assuming a constructor that can create an identity element
-        elif exponent == 1:
-            return self
-        elif exponent > 1:
-            result = self
-            for _ in range(exponent - 1):
-                result *= self  # assuming you've already implemented __mul__
-            return result
-        else:
-            raise ValueError("Exponent must be a non-negative integer for this example.")
+            return Floretion.from_string("e" * self.flo_order)
+        result = self
+        for _ in range(exponent - 1):
+            result = result * self
+        return result
 
-    def __add__(self, other):
+    def __add__(self, other: "Floretion") -> "Floretion":
         new_coeffs = self.coeff_vec_all + other.coeff_vec_all
         return Floretion(new_coeffs, self.base_vec_dec_all, self.grid_flo_loaded_data)
 
-    def __sub__(self, other):
+    def __sub__(self, other: "Floretion") -> "Floretion":
         new_coeffs = self.coeff_vec_all - other.coeff_vec_all
         return Floretion(new_coeffs, self.base_vec_dec_all, self.grid_flo_loaded_data)
 
-    def __eq__(self, other):
-        """
-        Check if this floretion is equal to another floretion.
-
-        Parameters:
-            other (Floretion): The floretion to compare with.
-
-        Returns:
-            bool: True if the floretions are equal, False otherwise.
-        """
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, Floretion):
-            # The other object is not a Floretion, so they can't be equal
             return False
-
         return np.array_equal(self.coeff_vec_all, other.coeff_vec_all)
 
-    # First declare mult_flo_base_absolute_value
+    # ---------------------------------------------------------------------
+    # Algebra su base vectors (bitwise)
+    # ---------------------------------------------------------------------
     @staticmethod
-    def mult_flo_base_absolute_value(a_base_val, b_base_val, flo_order):
-        """
-        Computes the absolute value of the product of two floretion base vectors.
-
-        Parameters:
-            a_base_val: The first base vector.
-            b_base_val: The second base vector.
-            flo_order: The floretion order.
-
-        Returns:
-            An integer representing the absolute value of the floretion product.
-        """
-        bitmask = int(2 ** (3 * flo_order) - 1)
-        a_base_val = abs(a_base_val)
-        b_base_val = abs(b_base_val)
-
-        return bitmask & (~(a_base_val ^ b_base_val))
+    def mult_flo_base_absolute_value(a_base_val: int, b_base_val: int, flo_order: int) -> int:
+        """Valore assoluto del prodotto di due base vectors (XNOR a 3-bit per cifra)."""
+        bitmask = _bitmask(flo_order)
+        a = abs(int(a_base_val))
+        b = abs(int(b_base_val))
+        return bitmask & (~(a ^ b))
 
     @staticmethod
-    def mult_flo_sign_only(a_base_val, b_base_val, flo_order):
-        """
-        Computes only the sign of the product of two floretion base vectors.
+    def mult_flo_sign_only(a_base_val: int, b_base_val: int, flo_order: int) -> int:
+        """Solo il segno del prodotto di due base vectors (±1)."""
+        bitmask = _bitmask(flo_order)
+        oct666 = _oct666(flo_order)
+        oct111 = _oct111(flo_order)
 
-        Parameters:
-            a_base_val: The first base vector.
-            b_base_val: The second base vector.
-            flo_order: The floretion order.
+        pre = sgn(a_base_val) * sgn(b_base_val)
+        a = abs(int(a_base_val))
+        b = abs(int(b_base_val))
 
-        Returns:
-            An integer representing the sign of the floretion product (-1 or 1).
-        """
-        bitmask = int(2 ** (3 * flo_order) - 1)
-        oct666 = int('6' * flo_order, 8)
-        oct111 = int('1' * flo_order, 8)
-
-        pre_sign = sgn(a_base_val) * sgn(b_base_val)
-        a_base_val = abs(a_base_val)
-        b_base_val = abs(b_base_val)
-
-        # Shift every 3-bits of "a" one to the left
-        a_cyc = ((a_base_val << 1) & oct666) | ((a_base_val >> 2) & oct111)
-
-        cyc_sign = 1 if count_bits((a_cyc & b_base_val) & bitmask) & 0b1 else -1
-        ord_sign = 1 if count_bits(bitmask) & 0b1 else -1
-
-        return (pre_sign * cyc_sign * ord_sign)
+        a_cyc = ((a << 1) & oct666) | ((a >> 2) & oct111)
+        cyc_sign = 1 if (((a_cyc & b) & bitmask).bit_count() & 1) == 1 else -1
+        ord_sign = 1 if (_bitmask(flo_order).bit_count() & 1) == 1 else -1
+        return pre * cyc_sign * ord_sign
 
     @staticmethod
-    def mult_flo_base_only(a_base_val, b_base_val, flo_order):
-        """
-        Computes only the sign of the product of two floretion base vectors.
+    def mult_flo_base_only(a_base_val: int, b_base_val: int, flo_order: int) -> int:
+        """Prodotto completo tra due base vectors (segno * valore assoluto)."""
+        bitmask = _bitmask(flo_order)
+        oct666 = _oct666(flo_order)
+        oct111 = _oct111(flo_order)
+        pre = sgn(a_base_val) * sgn(b_base_val)
+        a = abs(int(a_base_val))
+        b = abs(int(b_base_val))
+        a_cyc = ((a << 1) & oct666) | ((a >> 2) & oct111)
+        cyc_sign = 1 if (((a_cyc & b) & bitmask).bit_count() & 1) == 1 else -1
+        ord_sign = 1 if (_bitmask(flo_order).bit_count() & 1) == 1 else -1
+        abs_val = bitmask & (~(a ^ b))
+        return abs_val * (pre * cyc_sign * ord_sign)
 
-        Parameters:
-            a_base_val: The first base vector.
-            b_base_val: The second base vector.
-            flo_order: The floretion order.
-
-        Returns:
-            An integer representing the sign of the floretion product (-1 or 1).
-        """
-        bitmask = int(2 ** (3 * flo_order) - 1)
-        oct666 = int('6' * flo_order, 8)
-        oct111 = int('1' * flo_order, 8)
-
-        pre_sign = sgn(a_base_val) * sgn(b_base_val)
-        a_base_val = abs(a_base_val)
-        b_base_val = abs(b_base_val)
-
-        # Shift every 3-bits of "a" one to the left
-        a_cyc = ((a_base_val << 1) & oct666) | ((a_base_val >> 2) & oct111)
-
-        cyc_sign = 1 if count_bits((a_cyc & b_base_val) & bitmask) & 0b1 else -1
-        ord_sign = 1 if count_bits(bitmask) & 0b1 else -1
-
-        abs_val = bitmask & (~(a_base_val ^ b_base_val))
-        sign = (pre_sign * cyc_sign * ord_sign)
-
-        return abs_val * sign
-
-    # Then declare compute_possible_vecs and other functions
+    # ---------------------------------------------------------------------
+    # Possibili vettori Z (ottimizzazione sparsità)
+    # ---------------------------------------------------------------------
     @staticmethod
-    def compute_possible_vecs(x_base_vecs, y_base_vecs, flo_order, base_vecs_all):
+    def compute_possible_vecs(
+        x_base_vecs: Mapping[int, float] | Iterable[int],
+        y_base_vecs: Mapping[int, float] | Iterable[int],
+        flo_order: int,
+        base_vecs_all: Sequence[int],
+    ) -> set[int]:
         """
-         Computes a set of possible vectors for multiplication.
-
-         Parameters:
-             x_base_vecs: A list of base vectors for the first floretion.
-             y_base_vecs: A list of base vectors for the second floretion.
-             flo_order: The floretion order.
-             base_vecs_all: A list of all available base vectors.
-
-         Returns:
-             A set of possible base vectors.
-         """
-        possible_vecs = set()
-
-        if len(x_base_vecs) > len(base_vecs_all) // 2:
-            return set(base_vecs_all)
-
-        for z in base_vecs_all:
-            for x in x_base_vecs:
-                product_abs = Floretion.mult_flo_base_absolute_value(x, z, flo_order)
-                if product_abs in y_base_vecs:
-                    possible_vecs.add(z)
-
-        return possible_vecs
-
-    @staticmethod
-    def write_centers_to_file(flo_order, decomposition_type="pos"):
-
-        dummy_flo = Floretion.from_string(f'0{"e" * flo_order}')
-        base_vec_all = (dummy_flo.base_vec_dec_all)
-        result = {}
-
-        for base_vec in base_vec_all:
-            this_flo = Floretion(np.array([1]), np.array([base_vec]))
-            center = np.array(sorted(list(this_flo.find_center_base_vectors_only(decomposition_type))))
-            result[base_vec] = center
-
-        result_str_keys = {str(key): value.tolist() for key, value in result.items()}
-
-        # Manually construct the JSON string
-        json_lines = ["{"]
-        last_key = list(result_str_keys.keys())[-1]
-        for key, value in result_str_keys.items():
-            # Convert each key-value pair to a JSON string
-            json_pair = json.dumps({key: value})
-            json_pair = json_pair.strip("{}")
-
-            # Add a comma after each pair except the last one
-            if key != last_key:
-                json_pair += ","
-
-            json_lines.append("    " + json_pair)
-        json_lines.append("}")
-
-        json_string = "\n".join(json_lines)
-
-        # Write the formatted JSON string to a file
-        with open(f'center_data_order_{flo_order}.{decomposition_type}.json', 'w') as file:
-            file.write(json_string + "\n")  # Ensure there's a newline at the end of the file
-
-        # Save to JSON file
-        # with open(f'center_data_order_{flo_order}.json', 'w') as file:
-        #    json.dump(json_string, file, separators="\n")
-        # return result
-
-    @staticmethod
-    def load_centers(flo_order, decomposition_type="pos", storage_type="npy"):
-        # i:\dev\dev\python\floretions\data\centers\order_6\both\centers_order_6_segment_000.npy
-        centers_file_path = os.path.join(BASE_DIR, f'floretions/data/centers/order_{flo_order}/{decomposition_type}/',
-                                         f'centers_order_{flo_order}_segment_000.{storage_type}')
-
-        if storage_type == "npy":
-            center_data = np.load(centers_file_path, allow_pickle=True)
-        elif storage_type == "json":
-            # Load center data
-            with open(centers_file_path, 'r') as file:
-                center_data = json.load(file)
-
-        return center_data
-
-    @staticmethod
-    def multiply_segment(indices, signs, other_coeffs):
-        # Compute products of coefficients for each segment using precomputed indices and signs
-        x_coeffs_reordered = other_coeffs[indices] * signs
-
-        return np.dot(x_coeffs_reordered, other_coeffs)
-
-    def process_chunk(args):
-        z_indices, x_coeff_vec_all, y_coeff_vec_all, indices_matrix, signs_matrix = args
-        local_coeffs = []
-        for z_index in z_indices:
-            x_coeffs_reordered = x_coeff_vec_all[indices_matrix[z_index]] * signs_matrix[z_index]
-            local_coeffs.append(np.dot(x_coeffs_reordered, y_coeff_vec_all))
-        return local_coeffs
-
-    def __mul__(self, other):
+        Heuristica per ridurre i candidati z: cerca z tali che esista x con |x*z| in Y.
+        Accetta dict (come base_to_nonzero_coeff) o iterabili di interi.
         """
-        Overloads the multiplication (*) operator for Floretion instances.
-
-        Parameters:
-            other: A Floretion instance or a scalar (int, float) for scalar multiplication.
-
-        Returns:
-            A new Floretion instance resulting from the multiplication.
-
-        """
-        # Handle scalar multiplication
-        if isinstance(other, (int, float)):
-            new_coeff_vec_all = self.coeff_vec_all * other
-            return Floretion(new_coeff_vec_all, self.base_vec_dec_all, self.grid_flo_loaded_data)
-
-        # Handle floretion multiplication
+        if isinstance(x_base_vecs, Mapping):
+            x_keys = list(x_base_vecs.keys())
         else:
-            # An optimization step can be added here for low orders
-            if False:  # self.flo_order < 4:
-                possible_base_vecs = self.base_to_nonzero_coeff
-            else:
-                # Compute possible base vectors for optimization
-                possible_base_vecs = self.compute_possible_vecs(self.base_to_nonzero_coeff,
-                                                                other.base_to_nonzero_coeff,
-                                                                self.flo_order,
-                                                                self.base_vec_dec_all)
+            x_keys = list(x_base_vecs)
+        if isinstance(y_base_vecs, Mapping):
+            y_keys = set(y_base_vecs.keys())
+        else:
+            y_keys = set(y_base_vecs)
 
-            z_base_vecs = list()
-            z_coeffs = list()
 
-            if self.flo_order > 5:
-                do_table_import = True
-            else:
-                do_table_import = False
 
-            if not do_table_import:
-                # For each possible base vector 'z'
-                for z in possible_base_vecs:
-                    coeff_z = 0.0
+        # Se X è molto denso, non vale la pena filtrare
+        if len(x_keys) > len(base_vecs_all) // 2:
+            return set(map(int, base_vecs_all))
 
-                    # For each base vector 'y' of the other Floretion
-                    for base_vec_y, coeff_y in other.base_to_nonzero_coeff.items():
-                        # Compute absolute value product of base vectors
-                        check_if_in_base_vec_x = Floretion.mult_flo_base_absolute_value(z, base_vec_y, self.flo_order)
+        possible: set[int] = set()
+        for z in base_vecs_all:
+            z = int(z)
+            for x in x_keys:
+                product_abs = Floretion.mult_flo_base_absolute_value(int(x), z, flo_order)
+                if product_abs in y_keys:
+                    possible.add(z)
+                    break
+        return possible
 
-                        if check_if_in_base_vec_x in self.base_to_nonzero_coeff.keys():
-                            # Lookup coefficient for base vector x
-                            index_x = self.base_to_grid_index[check_if_in_base_vec_x]
-                            coeff_x = self.coeff_vec_all[index_x]
+    def mul_direct_legacy(self, other: "Floretion") -> "Floretion":
+        possible_base_vecs = self.compute_possible_vecs(
+            self.base_to_nonzero_coeff,
+            other.base_to_nonzero_coeff,
+            self.flo_order,
+            self.base_vec_dec_all
+        )
 
-                            # Compute coefficient for the result base vector z
-                            coeff_z += coeff_x * coeff_y * Floretion.mult_flo_sign_only(check_if_in_base_vec_x,
-                                                                                        base_vec_y,
-                                                                                        self.flo_order)
+        z_base_vecs = []
+        z_coeffs = []
+        print(possible_base_vecs)
+        for z in possible_base_vecs:
+            coeff_z = 0.0
+            for base_vec_y, coeff_y in other.base_to_nonzero_coeff.items():
+                check_if_in_base_vec_x = Floretion.mult_flo_base_absolute_value(
+                    z, base_vec_y, self.flo_order
+                )
+                if check_if_in_base_vec_x in self.base_to_nonzero_coeff.keys():
+                    index_x = self.base_to_grid_index[check_if_in_base_vec_x]
+                    coeff_x = self.coeff_vec_all[index_x]
+                    coeff_z += coeff_x * coeff_y * Floretion.mult_flo_sign_only(
+                        check_if_in_base_vec_x, base_vec_y, self.flo_order
+                    )
 
-                    z_coeffs.append(coeff_z)
-                    z_base_vecs.append(z)
+            z_coeffs.append(coeff_z)
+            z_base_vecs.append(z)
 
-                return Floretion(z_coeffs, z_base_vecs, self.grid_flo_loaded_data)
+        return Floretion(z_coeffs, z_base_vecs, self.grid_flo_loaded_data)
 
-            else:
 
-                filedir = f"./data/npy/order_{self.flo_order}"
-                segment = "000"  # segment_string = str(segment).zfill(3)
-                file_name_ind = f'{filedir}/floretion_order_{self.flo_order}_segment_{segment}_indices.npy'
-                file_name_sgn = f'{filedir}/floretion_order_{self.flo_order}_segment_{segment}_signs.npy'
+    # ---------------------------------------------------------------------
+    # Moltiplicazione (fast-path + rispetto strategia config + segmenti)
+    # ---------------------------------------------------------------------
+    def __mul__(self, other: "Floretion | float | int") -> "Floretion":
+        # scalare
+        if isinstance(other, (int, float)):
+            return Floretion(
+                self.coeff_vec_all * float(other),
+                self.base_vec_dec_all,
+                self.grid_flo_loaded_data,
+            )
 
-                indices_matrix = np.load(file_name_ind)
-                signs_matrix = np.load(file_name_sgn)
+        assert self.flo_order == other.flo_order, "Ordini diversi: gruppi distinti, non moltiplicabili."
 
-                # print(indices_matrix[0])
-                # print(signs_matrix)
-                # For each possible base vector 'z'
-                for z_index, z_base_vec in enumerate(self.base_vec_dec_all):
-                    # print(f'z_index {z_index} z_base_vec {z_base_vec}')
-                    # print(self.coeff_vec_all[indices_matrix[z_index]])
-                    x_coeffs_reordered = self.coeff_vec_all[indices_matrix[z_index]] * signs_matrix[z_index]
-                    z_coeffs.append(np.dot(x_coeffs_reordered, other.coeff_vec_all))
+        import warnings
+        from lib.floretion_utils.config_paths import load_config
 
+        cfg = load_config()
+        n = int(self.flo_order)
+
+        def log(msg: str) -> None:
+            if cfg.get("log_mul_strategy", False):
+                logger.info("[mul] %s", msg)
+
+        # ---- direct (sparse-friendly) -----------------------------------
+        # ---- direct (sparse-friendly) -----------------------------------
+        def mul_direct() -> "Floretion":
+            """
+            Moltiplicazione diretta sfruttando solo i termini con coefficiente non nullo.
+            Usa:
+            - self.base_to_nonzero_coeff per i contributi da self
+            - other.base_to_nonzero_coeff per i contributi da other
+            - self.index_by_val per mappare QUALSIASI z della griglia al suo indice.
+            """
+            possible_base_vecs = self.compute_possible_vecs(
+                self.base_to_nonzero_coeff,
+                other.base_to_nonzero_coeff,
+                self.flo_order,
+                self.base_vec_dec_all,
+            )
+            z_base_vecs = np.array(self.base_vec_dec_all)
+            z_coeffs = np.zeros(len(self.base_vec_dec_all), dtype=float)
+
+            for z in possible_base_vecs:
+                z_int = int(z)
+                acc = 0.0
+                for y_bv, coeff_y in other.base_to_nonzero_coeff.items():
+                    if coeff_y == 0:
+                        continue
+                    x_match = Floretion.mult_flo_base_absolute_value(z_int, y_bv, self.flo_order)
+                    idx_x = self.base_to_grid_index.get(x_match)
+                    if idx_x is None:
+                        continue
+                    coeff_x = self.coeff_vec_all[idx_x]
+                    if coeff_x == 0:
+                        continue
+                    acc += coeff_x * coeff_y * Floretion.mult_flo_sign_only(
+                        x_match, y_bv, self.flo_order
+                    )
+
+                # QUI il punto chiave: usiamo la mappa completa della griglia
+                idx_z = self.index_by_val.get(z_int)
+                if idx_z is None:
+                    raise RuntimeError(
+                        f"mul_direct: base vector z={z_int} non trovato in index_by_val "
+                        f"(order={self.flo_order})"
+                    )
+                z_coeffs[idx_z] = acc
+
+            return Floretion(z_coeffs, z_base_vecs, self.grid_flo_loaded_data)
+
+        # ---- direct + square_fast (solo quando abbiamo scelto direct) ---
+        def mul_direct_maybe_squarefast() -> "Floretion":
+            """
+            Usa square_fast *solo* se abbiamo già deciso per la via direct
+            (niente NPY/segmenti per questo prodotto).
+            """
+            if cfg.get("enable_square_fast", True) and self == other:
+                if cfg.get("log_square_fast", False):
+                    logger.info("[square_fast] x==y → using square_fast (direct kernel)")
+                return _square_fast_alias(
+                    self,
+                    use_centers=cfg.get("square_fast_use_centers", True),
+                    centers_mode=cfg.get("square_fast_centers_mode", "both"),
+                    centers_storage=cfg.get("square_fast_centers_storage", "npy"),
+                )
+            return mul_direct()
+
+        # ---- metriche e fast-path globali --------------------------------
+        nnz_x = int(np.count_nonzero(self.coeff_vec_all))
+        nnz_y = int(np.count_nonzero(other.coeff_vec_all))
+        prod_nnz = nnz_x * nnz_y
+        instant_thresh = int(cfg.get("nnz_product_instant_threshold", 4096))
+
+        # Warning solo se davvero può essere lungo (molti termini da considerare)
+        if n > 7 and prod_nnz > instant_thresh:
+            warnings.warn(
+                f"[Floretion] multiplication at order {n} may take a long time "
+                f"if there are many terms (nnz_x*nnz_y={prod_nnz} > {instant_thresh})!",
+                RuntimeWarning,
+            )
+
+        # Fast path: prodotto nnz piccolo → direct/square_fast
+        if prod_nnz <= instant_thresh:
+            log(f"small nnz product (prod={prod_nnz} ≤ {instant_thresh}) → direct/square_fast")
+            return mul_direct_maybe_squarefast()
+
+        # ---- soglie classiche 4^(n-2), 4^(n-1) (configurabili) ----------
+        def pow4(k: int) -> int:
+            return 4 ** max(int(k), 0)
+
+        single_off = int(cfg.get("direct_single_pow_offset", 2))  # regola 2: 4^(n-2)
+        both_off = int(cfg.get("direct_both_pow_offset", 1))  # regola 3: 4^(n-1)
+        t_single = pow4(n - single_off)  # 4^(n-2)
+        t_both = pow4(n - both_off)  # 4^(n-1)
+        enable_direct_both_rule = bool(cfg.get("enable_direct_both_rule", False))
+
+        # ---- strategia da config per l'ordine ----------------------------
+        strategy = get_mult_strategy(self.flo_order)  # "direct" | "npy-mono" | "npy-segment-num-K"
+        if n > 5:
+            log(f"order={n} strategy={strategy} #nonzero_x={nnz_x} #nonzero_y={nnz_y} prod={prod_nnz}")
+
+        # ============================ n ≤ 8 ===============================
+        if n <= 8:
+            # 1) direct forzato da config
+            if strategy == "direct":
+                if n > 1:
+                    log("config forces direct")
+                return mul_direct_maybe_squarefast()
+
+            # 2) preferisci i segmenti/mono se richiesti da config; usa direct solo se MOLTO sparso
+            if strategy == "npy-mono" or parse_segment_num(strategy) is not None:
+                # se uno è davvero sparso → direct è meglio
+                if (nnz_x < t_single) or (nnz_y < t_single):
+                    log(f"very sparse (nnz < 4^(n-2)={t_single}) → direct/square_fast")
+                    return mul_direct_maybe_squarefast()
+
+                # altrimenti usa NPY
+                logger.info("Multiplication strategy %s", strategy)
+
+                # ---- npy-mono ----
+                if strategy == "npy-mono":
+                    base = data_dir() / "npy" / f"order_{self.flo_order}"
+                    ind_path = base / f"floretion_order_{self.flo_order}_segment_000_indices.npy"
+                    sgn_path = base / f"floretion_order_{self.flo_order}_segment_000_signs.npy"
+                    if not (ind_path.exists() and sgn_path.exists()):
+                        log("npy-mono files missing → fallback to direct")
+                        return mul_direct_maybe_squarefast()
+
+                    indices_matrix = np.load(ind_path, mmap_mode="r")
+                    signs_matrix = np.load(sgn_path, mmap_mode="r")
+                    z_coeffs = np.zeros(len(self.base_vec_dec_all), dtype=float)
+
+                    y_nz = np.flatnonzero(other.coeff_vec_all)
+                    other_nz = other.coeff_vec_all[y_nz]
+
+                    for z_index in range(indices_matrix.shape[0]):
+                        row_idx = indices_matrix[z_index]
+                        row_sgn = signs_matrix[z_index]
+                        x_reordered_sel = self.coeff_vec_all[row_idx[y_nz]] * row_sgn[y_nz]
+                        z_coeffs[z_index] = float(np.dot(x_reordered_sel, other_nz))
+
+                    log("used npy-mono")
+                    return Floretion(z_coeffs, self.base_vec_dec_all, self.grid_flo_loaded_data)
+
+                # ---- npy-segments K ----
+                segnum = parse_segment_num(strategy)
+                logger.info("Using npy segments (strategy=%s, segnum=%s)", strategy, segnum)
+
+                test_iter = list(iter_npy_segments(self.flo_order, limit=1))
+                logger.debug("First segment probe for order %d: %s", self.flo_order, test_iter)
+
+                # Se la strategia segmenti è configurata ma non esistono segmenti, è un errore
+                if not test_iter:
+                    msg = (
+                        f"npy-segment strategy {strategy} configured for order {self.flo_order}, "
+                        f"ma nessun file di segmento .npy trovato. "
+                        f"Genera i file di segmenti o modifica order_{self.flo_order}_mult_strategy."
+                    )
+                    logger.error(msg)
+                    logger.error(expected_layout_summary(self.flo_order))
+                    raise FileNotFoundError(msg)
+
+                z_coeffs = np.zeros(len(self.base_vec_dec_all), dtype=float)
+                y_nz = np.flatnonzero(other.coeff_vec_all)
+                other_nz = other.coeff_vec_all[y_nz]
+                z_offset = 0
+
+                for ind_path, sgn_path, _ in iter_npy_segments(self.flo_order, limit=segnum):
+                    if not (ind_path.exists() and sgn_path.exists()):
+                        msg = (
+                            f"Missing .npy segment files for order {self.flo_order}: "
+                            f"{ind_path} or {sgn_path} does not exist "
+                            f"(strategy {strategy}, segnum={segnum})."
+                        )
+                        logger.error(msg)
+                        raise FileNotFoundError(msg)
+
+                    logger.debug("Loading segment indices from %s", ind_path)
+                    indices_chunk = np.load(ind_path, mmap_mode="r")
+                    signs_chunk = np.load(sgn_path, mmap_mode="r")
+                    rows = indices_chunk.shape[0]
+
+                    for local_z in range(rows):
+                        row_idx = indices_chunk[local_z]
+                        row_sgn = signs_chunk[local_z]
+                        x_reordered_sel = self.coeff_vec_all[row_idx[y_nz]] * row_sgn[y_nz]
+                        z_coeffs[z_offset + local_z] = float(np.dot(x_reordered_sel, other_nz))
+                    z_offset += rows
+
+                if z_offset == 0:
+                    msg = (
+                        f"No segment rows were loaded for order {self.flo_order} "
+                        f"(strategy {strategy}, segnum={segnum})."
+                    )
+                    logger.error(msg)
+                    raise RuntimeError(msg)
+
+                log(f"used npy-segment-num-{segnum}")
                 return Floretion(z_coeffs, self.base_vec_dec_all, self.grid_flo_loaded_data)
 
-    def mul_sp(self, other):
-        if isinstance(other, (int, float)):
-            new_coeff_vec_all = self.coeff_vec_all * other
-            return Floretion(new_coeff_vec_all, self.base_vec_dec_all)
-        else:
-            if self.flo_order < 4:
-                possible_base_vecs = self.base_vec_dec_all
-            else:
-                possible_base_vecs = self.compute_possible_vecs(self.base_to_nonzero_coeff, other.base_to_nonzero_coeff,
-                                                                self.flo_order, self.base_vec_dec_all)
+            # 3) (opzionale) regola both < 4^(n-1) → direct  [disabilitata di default]
+            if enable_direct_both_rule and (nnz_x < t_both) and (nnz_y < t_both):
+                log(f"nnz < 4^(n-1) (both) → direct (t_both={t_both})")
+                return mul_direct_maybe_squarefast()
 
-            # print(f" possible_base_vecs: {possible_base_vecs}")
+            # 4) fallback: direct
+            log("fallback to direct")
+            return mul_direct_maybe_squarefast()
 
-            z_base_vecs = list()
-            z_coeffs = list()
-            # For each possible base vector 'z'
-            for z in possible_base_vecs:
-                coeff_z = 0.0
+        # ======================= 8 < n ≤ 10 ===============================
+        if 8 < n <= 10:
+            # Nota: la fast-path per prod_nnz piccolo è già stata gestita sopra.
+            # Qui siamo in regime di prodotto grande.
 
-                for base_vec_y, coeff_y in other.base_to_nonzero_coeff.items():
-                    check_if_in_base_vec_x = Floretion.mult_flo_base_absolute_value(z, base_vec_y, self.flo_order)
-                    # print(f" check_if_in_base_vec_x {check_if_in_base_vec_x}")
+            # richiede entrambi molto sparsi per direct
+            if (nnz_x < t_single) and (nnz_y < t_single):
+                log(f"high-order direct: both < 4^(n-2) (t_single={t_single})")
+                return mul_direct_maybe_squarefast()
 
-                    if check_if_in_base_vec_x in self.base_to_nonzero_coeff.keys():
-                        # index_y = other.base_to_grid_index[base_vec_y]
-                        # coeff_y = other.coeff_vec_all[index_y]
+            msg = (
+                f"Exceeded maximum number of base vectors for direct computation at order {n} "
+                f"(nnz_x={nnz_x}, nnz_y={nnz_y}, prod_nnz={prod_nnz})."
+            )
+            logger.error(msg)
+            raise RuntimeError(msg)
 
-                        index_x = self.base_to_grid_index[check_if_in_base_vec_x]
-                        coeff_x = self.coeff_vec_all[index_x]
-                        coeff_z += coeff_x * coeff_y * floretion_base_vector.mult_flo_sign_only(check_if_in_base_vec_x,
-                                                                                                base_vec_y,
-                                                                                                self.flo_order)
-                        # print(f" coeff_z {coeff_z}  coeff_c {coeff_x} coeff_y {coeff_y} sign = {floretion_base_vector.mult_flo_sign_only(check_if_in_base_vec_x, base_vec_y, self.flo_order)}!")
+        # =========================== n > 10 ================================
+        # fallback prudente
+        log("n>10 → fallback to direct")
+        return mul_direct_maybe_squarefast()
 
-                # print(f" z_coeff {z_coeff}!")
-                z_coeffs.append(coeff_z)
-                z_base_vecs.append(z)
-
-            return z_coeffs
-
-    def mul_sp(self, other):
-        if isinstance(other, (int, float)):
-            new_coeff_vec_all = self.coeff_vec_all * other
-            return Floretion(new_coeff_vec_all, self.base_vec_dec_all)
-        else:
-            if self.flo_order < 4:
-                possible_base_vecs = self.base_vec_dec_all
-            else:
-                possible_base_vecs = self.compute_possible_vecs(self.base_to_nonzero_coeff, other.base_to_nonzero_coeff,
-                                                                self.flo_order, self.base_vec_dec_all)
-
-            # print(f" possible_base_vecs: {possible_base_vecs}")
-
-            z_base_vecs = list()
-            z_coeffs = list()
-            # For each possible base vector 'z'
-            for z in possible_base_vecs:
-                coeff_z = 0.0
-
-                for base_vec_y, coeff_y in other.base_to_nonzero_coeff.items():
-                    check_if_in_base_vec_x = Floretion.mult_flo_base_absolute_value(z, base_vec_y, self.flo_order)
-                    # print(f" check_if_in_base_vec_x {check_if_in_base_vec_x}")
-
-                    if check_if_in_base_vec_x in self.base_to_nonzero_coeff.keys():
-                        # index_y = other.base_to_grid_index[base_vec_y]
-                        # coeff_y = other.coeff_vec_all[index_y]
-
-                        index_x = self.base_to_grid_index[check_if_in_base_vec_x]
-                        coeff_x = self.coeff_vec_all[index_x]
-                        coeff_z += coeff_x * coeff_y * floretion_base_vector.mult_flo_sign_only(check_if_in_base_vec_x,
-                                                                                                base_vec_y,
-                                                                                                self.flo_order)
-                        # print(f" coeff_z {coeff_z}  coeff_c {coeff_x} coeff_y {coeff_y} sign = {floretion_base_vector.mult_flo_sign_only(check_if_in_base_vec_x, base_vec_y, self.flo_order)}!")
-
-                # print(f" z_coeff {z_coeff}!")
-                z_coeffs.append(coeff_z)
-                z_base_vecs.append(z)
-
-            return z_coeffs
-
-    def __rmul__(self, scalar):
+    # ---------------------------------------------------------------------
+    # Utility istanza
+    # ---------------------------------------------------------------------
+    def __rmul__(self, scalar: float | int) -> "Floretion":
         if isinstance(scalar, (int, float)):
-            new_coeff_vec_all = self.coeff_vec_all * scalar
-            return Floretion(new_coeff_vec_all, self.base_vec_dec_all)
+            return Floretion(
+                self.coeff_vec_all * float(scalar),
+                self.base_vec_dec_all,
+                self.grid_flo_loaded_data,
+            )
+        return NotImplemented
 
-    def as_floretion_notation(self):
-        floretion_terms = []
-
+    def as_floretion_notation(self) -> str:
+        terms: List[str] = []
         for coeff, base_vec in zip(self.coeff_vec_all, self.base_vec_dec_all):
-            # Create a string for the coefficient
-            if coeff == 1:
-                coeff_str = "+"
-            elif coeff == -1:
-                coeff_str = "-"
-            else:
-                coeff_str = f"{coeff:+.4f}"
+            if coeff == 0:
+                continue
+            coeff_val = float(coeff)
+            sign = "+" if coeff_val > 0 else "-"
+            mag = abs(coeff_val)
+            coeff_str = sign if np.isclose(mag, 1.0) else f"{sign}{mag:.4f}".rstrip("0").rstrip(".")
 
-            # Convert base-8 digits back to floretion symbols
-            base_vec_str = ""
-            base_vec_copy = base_vec
-            while base_vec_copy > 0:
-                digit = base_vec_copy & 7
-                if digit == 1:
-                    base_vec_str = 'i' + base_vec_str
-                elif digit == 2:
-                    base_vec_str = 'j' + base_vec_str
-                elif digit == 4:
-                    base_vec_str = 'k' + base_vec_str
-                elif digit == 7:
-                    base_vec_str = 'e' + base_vec_str
-                base_vec_copy >>= 3
+            base = int(base_vec)
+            s = ""
+            while base > 0:
+                digit = base & 7
+                s = (
+                    ("i" if digit == 1 else "j" if digit == 2 else "k" if digit == 4 else "e")
+                    + s
+                )
+                base >>= 3
+            terms.append(f"{coeff_str}{s}")
 
-            # Assemble the term
-            term = f"{coeff_str}{base_vec_str}"
+        if not terms:
+            return "_0_"
 
-            if coeff != 0:
-                floretion_terms.append(term.strip())
+        res = " ".join(terms)
+        res = res.replace(" + -", " - ").replace(" + +", " + ").lstrip()
+        if res.startswith("+"):
+            res = res[1:]
+        if res.startswith("+-"):
+            res = "-" + res[2:]
+        res = res.replace("--", "-")
+        return res.strip()
 
-        result_string = " ".join(floretion_terms).replace(" + -", " - ").replace(" + +", " + ")
-        if result_string == "":
-            result_string = " _0_"
-        return result_string
+    def sum_of_squares(self) -> float:
+        return float(np.dot(self.coeff_vec_all, self.coeff_vec_all))
 
-    def tes(self):
-        return self.coeff_vec_all[-1]
+    def abs(self) -> float:
+        return float(np.sqrt(self.sum_of_squares()))
+
+    # ---------------------------------------------------------------------
+    # Statiche leggere + wrapper verso lib.ops
+    # ---------------------------------------------------------------------
+    @staticmethod
+    def decimal_to_octal(decimal: int) -> str:
+        return format(int(decimal), "o")
 
     @staticmethod
-    def normalize_coeffs(floretion, max_abs_value=2.0):
-        """
-        Normalize the coefficients of a given Floretion instance and return a new instance.
-
-        Args:
-            floretion (Floretion): The Floretion instance to normalize.
-            max_abs_value (float): The desired maximum absolute value of the coefficients.
-
-        Returns:
-            Floretion: New Floretion instance with normalized coefficients.
-        """
-        max_coeff = np.max(np.abs(floretion.coeff_vec_all))
-        if max_coeff != 0:  # Avoid division by zero
-            normalized_coeff_vec_all = max_abs_value * floretion.coeff_vec_all / max_coeff
+    def get_basevec_index(base_vec, type: str = "dec") -> int:
+        if type not in {"dec", "oct"}:
+            raise ValueError('type deve essere "dec" o "oct"')
+        if type == "dec":
+            base_dec = int(base_vec)
+            oct_str = format(base_dec, "o")
         else:
-            normalized_coeff_vec_all = floretion.coeff_vec_all
+            oct_str = str(base_vec)
+            base_dec = int(oct_str, 8)
 
-        # Create a new Floretion instance with normalized coefficients
-        return Floretion(normalized_coeff_vec_all, floretion.base_vec_dec_all, floretion.grid_flo_loaded_data)
+        order = len(oct_str)
+        file_path = get_grid_csv(order)
+        try:
+            df = pd.read_csv(file_path, dtype={"oct": str})
+        except FileNotFoundError as e:
+            logger.error("=== ERRORE: file griglia non trovato (get_basevec_index) ===")
+            logger.error("Tentato: %s", file_path)
+            logger.error(expected_layout_summary(order))
+            logger.error("============================================================")
+            raise FileNotFoundError(
+                f"Griglia mancante per ordine {order}: {file_path}. "
+                f"Consulta la struttura attesa nel log."
+            ) from e
+
+        rows = df.index[df["floretion"].astype(int) == int(base_dec)].tolist()
+        if not rows:
+            raise ValueError(f"Base vector {base_dec} (oct {oct_str}) non presente in {file_path.name}")
+        return int(rows[0])
+
+    # Wrapper statici
+    @staticmethod
+    def normalize_coeffs(floretion: "Floretion", max_abs_value: float = 2.0) -> "Floretion":
+        return _normalize_coeffs(floretion, max_abs_value)
 
     @staticmethod
-    def fractional_coeffs(floretion, max_abs_value=2.0):
-        """
-
-        """
-        frac_coeffs = floretion.coeff_vec_all - np.round(floretion.coeff_vec_all, 0)
-
-        # Create a new Floretion instance with normalized coefficients
-        return Floretion(frac_coeffs, floretion.base_vec_dec_all, floretion.grid_flo_loaded_data)
+    def fractional_coeffs(floretion: "Floretion", max_abs_value: float = 2.0) -> "Floretion":
+        return _fractional_coeffs(floretion, max_abs_value)
 
     @staticmethod
-    def mirror(floretion, axis):
-        """
-        Mirror the Floretion instance across the specified axis.
-
-        Args:
-            floretion (Floretion): The Floretion instance to mirror.
-            axis (str): The axis to mirror across ('I', 'J', or 'K').
-
-        Returns:
-            Floretion: New Floretion instance mirrored across the specified axis.
-
-        Raises:
-            ValueError: If the axis is not 'I', 'J', or 'K'.
-        """
-        if axis not in ["I", "J", "K"]:
-            raise ValueError("Axis must be 'I', 'J', or 'K'.")
-
-        new_coeffs = np.zeros_like(floretion.coeff_vec_all)
-        for coeff, base_vec in zip(floretion.coeff_vec_all, floretion.base_vec_dec_all):
-            # Convert base_vec to octal and perform digit swaps based on the axis
-            octal_str = format(base_vec, 'o')
-            if axis == "I":
-                octal_str = octal_str.replace('2', 'x').replace('4', '2').replace('x', '4')
-            elif axis == "J":
-                octal_str = octal_str.replace('1', 'x').replace('4', '1').replace('x', '4')
-            elif axis == "K":
-                octal_str = octal_str.replace('1', 'x').replace('2', '1').replace('x', '2')
-
-            # Convert back to decimal
-            new_base_vec = int(octal_str, 8)
-            # Find the index of the new base vector
-            idx = np.where(floretion.base_vec_dec_all == new_base_vec)[0]
-            # Set the corresponding coefficient
-            if idx.size > 0:
-                new_coeffs[idx[0]] = coeff
-
-        # Create a new Floretion instance with the new coefficients
-        return Floretion(new_coeffs, floretion.base_vec_dec_all, floretion.grid_flo_loaded_data)
-
-    def sum_of_squares(self):
-        return sum(coeff ** 2 for coeff in self.coeff_vec_all)
-
-    def abs(self):
-        return np.sqrt(self.sum_of_squares())
+    def mirror(floretion: "Floretion", axis: str) -> "Floretion":
+        return _mirror(floretion, axis)
 
     @staticmethod
-    def decimal_to_octal(decimal):
-        return format(int(decimal), 'o')
+    def split_by_leading_symbol(floretion: "Floretion") -> tuple["Floretion", "Floretion", "Floretion", "Floretion"]:
+        return _split_by_leading_symbol(floretion)
 
     @staticmethod
-    def get_typical_floretions(name, order):
-        print(f"Creating floretion {name} of order {order}.")
+    def cyc(floretion: "Floretion") -> "Floretion":
+        return _cyc(floretion)
 
-        # Initialize the base floretion and unit only once
-        zero_flo = 0 * Floretion.from_string(f'1{"e" * order}')
-        unit_flo = Floretion.from_string(f'1{"e" * order}')
+    @staticmethod
+    def tri(floretion: "Floretion") -> "Floretion":
+        return _tri(floretion)
 
+    @staticmethod
+    def strip_flo(floretion: "Floretion") -> "Floretion":
+        return _strip_flo(floretion)
 
-        # Create base lists for coefficients
-        new_coeffs_sierp = []
-        new_coeffs_sierp_i = []
-        new_coeffs_sierp_j = []
-        new_coeffs_sierp_k = []
+    @staticmethod
+    def grow_flo(floretion: "Floretion") -> "Floretion":
+        return _grow_flo(floretion)
 
-        axis_i = []
-        axis_j = []
-        axis_k = []
+    @staticmethod
+    def proj(floretion: "Floretion") -> "Floretion":
+        return _proj(floretion)
 
-        # Calculate coefficients based on the zero floretion's base vectors
-        for base in zero_flo.base_vec_dec_all:
-            base_octal = Floretion.decimal_to_octal(base)
+    @staticmethod
+    def proj_strip_grow(floretion: "Floretion", m: int = 1) -> "Floretion":
+        return _proj_strip_grow(floretion, m)
 
-            new_coeffs_sierp.append(0.0 if '7' in base_octal else 1.0)
-            new_coeffs_sierp_i.append(0.0 if '1' in base_octal else 1.0)
-            new_coeffs_sierp_j.append(0.0 if '2' in base_octal else 1.0)
-            new_coeffs_sierp_k.append(0.0 if '4' in base_octal else 1.0)
-
-            axis_i.append(0.0 if '2' in base_octal or '4' in base_octal else 1.0)
-            axis_j.append(0.0 if '4' in base_octal or '1' in base_octal else 1.0)
-            axis_k.append(0.0 if '1' in base_octal or '2' in base_octal else 1.0)
-
-        # Convert lists to NumPy arrays for fast array operations
-        new_coeffs_sierp = new_coeffs_sierp
-        new_coeffs_sierp_i = new_coeffs_sierp_i
-        new_coeffs_sierp_j = new_coeffs_sierp_j
-        new_coeffs_sierp_k = new_coeffs_sierp_k
-
-        coeffs_axis_i = axis_i
-        coeffs_axis_j = axis_j
-        coeffs_axis_k = axis_k
-
-        norm_fac = np.sqrt(1. / (order + 1) ** 3)
-
-        # Define the dictionary for lazy-loaded floretion instances
-        name_to_floretion = {
-            "zero_flo": lambda: zero_flo,
-            "unit_flo": lambda: unit_flo,
-            "uniform_flo": lambda: Floretion(np.ones(zero_flo.base_vec_dec_all.size), zero_flo.base_vec_dec_all, format_type="dec"),
-            "sierp_flo": lambda: Floretion(norm_fac * new_coeffs_sierp, zero_flo.base_vec_dec_all, format_type="dec"),
-            "sierp_flo_i": lambda: Floretion(norm_fac * new_coeffs_sierp_i, zero_flo.base_vec_dec_all,
-                                             format_type="dec"),
-            "sierp_flo_j": lambda: Floretion(norm_fac * new_coeffs_sierp_j, zero_flo.base_vec_dec_all,
-                                             format_type="dec"),
-            "sierp_flo_k": lambda: Floretion(norm_fac * new_coeffs_sierp_k, zero_flo.base_vec_dec_all,
-                                             format_type="dec"),
-            "axis_ijk": lambda: (Floretion(coeffs_axis_i, zero_flo.base_vec_dec_all, format_type="dec") +
-                                 Floretion(coeffs_axis_j, zero_flo.base_vec_dec_all, format_type="dec") +
-                                 Floretion(coeffs_axis_k, zero_flo.base_vec_dec_all, format_type="dec") - 2 * unit_flo),
-            "axis_ij": lambda: (Floretion(coeffs_axis_i, zero_flo.base_vec_dec_all, format_type="dec") +
-                                Floretion(coeffs_axis_j, zero_flo.base_vec_dec_all, format_type="dec") - unit_flo),
-            "axis_jk": lambda: (Floretion(coeffs_axis_j, zero_flo.base_vec_dec_all, format_type="dec") +
-                                Floretion(coeffs_axis_k, zero_flo.base_vec_dec_all, format_type="dec") - unit_flo),
-            "axis_ki": lambda: (Floretion(coeffs_axis_k, zero_flo.base_vec_dec_all, format_type="dec") +
-                                Floretion(coeffs_axis_i, zero_flo.base_vec_dec_all, format_type="dec") - unit_flo)
-        }
-
-        # Lazy initialize the floretion based on the 'name'
-        if name in name_to_floretion:
-            result = name_to_floretion[name]()  # Call the lambda function to initialize the floretion
-        else:
-            result = None  # Or raise an error if the name is unknown
-
-        return result
-
-    @classmethod
-    def from_string(cls, flo_string, format_type="dec"):
-
-        flo_string = flo_string.replace(" ", "")
-
-        if not all(c in "0123456789ijke.+-()" for c in flo_string):
-            raise ValueError("Invalid character in floretion string. E.g. 3rd order: 3.5iii + jjk - 0.5eee (do not use '*')")
-
-        flo_terms = flo_string.split(")(")
-
-        # Error check 1: No invalid characters
+    @staticmethod
+    def write_centers_to_file(flo_order: int, decomposition_type: str = "pos"):
+        return _write_centers_to_file(flo_order, decomposition_type)
 
 
-        # Error check 2: No invalid signs
-        if "++" in flo_string or "+-" in flo_string or "-+" in flo_string or "--" in flo_string:
-            raise ValueError("Invalid sign combination in floretion string.")
 
-        flo_string = flo_string.replace(" ", "")
-        terms_str = re.findall(r'[\+\-]?[0-9]*\.?[0-9]*[ijke]+', flo_string)
+    @staticmethod
+    def get_typical_floretions(name: str, order: int):
+        return _get_typical_floretions(name, order)
 
-        coeffs = []
-        base_vecs = []
 
-        for term in terms_str:
-            match = re.match(r'([\+\-]?[0-9]*\.?[0-9]*)?([ijke]+)', term)
-            if match:
-                coeff_str, base_vec_str = match.groups()
-                coeff = float(coeff_str) if coeff_str and coeff_str != '-' and coeff_str != '+' else 1.0
-                if coeff_str and coeff_str[0] == '-':
-                    coeff = -1.0 if coeff_str == '-' else coeff
-                if coeff_str and coeff_str[0] == '+':
-                    coeff = 1.0 if coeff_str == '+' else coeff
-
-                base_vec = 0
-                for ch in base_vec_str:
-                    if ch == 'i':
-                        base_vec = (base_vec << 3) | 1
-                    elif ch == 'j':
-                        base_vec = (base_vec << 3) | 2
-                    elif ch == 'k':
-                        base_vec = (base_vec << 3) | 4
-                    elif ch == 'e':
-                        base_vec = (base_vec << 3) | 7
-                    else:
-                        raise ValueError(f"Invalid character {ch} in floretion string.")
-
-                coeffs.append(coeff)
-                base_vecs.append(base_vec)
-            else:
-                raise ValueError(f"Invalid term '{term}' in floretion string.")
-
-        return cls(coeffs_of_base_vecs=np.array(coeffs), base_vecs=np.array(base_vecs), format_type=format_type)
-
-    def inverse(self):
-        # Check if flo is a single base floretion (positive or negative)
-        non_zero_elements = [coeff for coeff in self.coeff_vec_all if coeff != 0]
-        if len(non_zero_elements) == 1 and abs(non_zero_elements[0]) == 1:
-            # flo is a base floretion
-            if self * self == Floretion.from_string("e"):
-                return self  # Inverse is the floretion itself
-            else:
-                return -1 * self  # Inverse is the negative of the floretion
-        else:
-            raise ValueError("Floretion is not a base floretion.")
-
-    def find_center(self):
+    @staticmethod
+    def load_centers(
+            flo_order: int,
+            decomposition_type: str = "both",
+            storage_type: str = "npy",
+            **kwargs,
+    ):
         """
-        Find all base vectors that commute with this floretion.
-
-        Returns:
-            A list of base vectors that commute with this floretion.
+        Compat:
+          - l’add-on passa decomposition_type="pos|neg|both"
+          - vecchio codice poteva passare mode="pos|neg|both"
         """
-        commuting_base_vectors = []
+        # alias legacy
+        parity = kwargs.get("mode", decomposition_type)
+        return _load_centers(
+            int(flo_order),
+            parity=parity,
+            storage_type=storage_type,
+        )
 
-        for base_vec in self.base_vec_dec_all:
-            # Initialize the base vector as a Floretion object
-            base_floretion = Floretion([1], [base_vec], format_type="dec")
-
-            # Check if the base vector commutes with this floretion
-            if self * base_floretion == base_floretion * self:
-                commuting_base_vectors.append(base_vec)
-
-        return commuting_base_vectors
-
-    def centered_flo(self, decomposition_type="both"):
-
-        # initialize to zero
-        result_flo = Floretion.from_string(f'0{"e" * self.flo_order}')
-
-        for base_vec, coeff in self.base_to_nonzero_coeff.items():
-            if coeff > 0:
-                pass
-            # reinitialize
-            this_flo = Floretion(np.array([1]), np.array([base_vec]))
-            center = np.array(list(this_flo.find_center_base_vectors_only(decomposition_type)))
-            result_flo = result_flo + Floretion(coeff * np.ones(center.size), center, format_type="dec")
-
-        return result_flo
-
-    def find_center_base_vectors_only(self, decomposition_type="both"):
+    @staticmethod
+    def write_centers_to_file(flo_order: int,
+                              mode: str = "both",
+                              storage_type: str = "npy") -> None:
         """
-        Find all base vectors whose product with this floretion (considered as a base vector)
-        has the same sign as the product in the reverse order.
-
-        Returns:
-            A list of base vectors that commute with this floretion as a base vector.
+        Facciata per scrivere/rigenerare i centers su disco (se usi un job ad hoc).
         """
-        commuting_base_vectors = set()
+        _write_centers_to_file(
+            order=flo_order,
+            mode=mode,
+            storage_type=storage_type,
+        )
 
-        # Assuming 'self' is a base vector, represented by a single nonzero coefficient
-        if len(self.base_to_nonzero_coeff) != 1:
-            raise ValueError("The floretion must be a single base vector")
 
-        # Get the base vector and its order
-        base_vec_self, _ = next(iter(self.base_to_nonzero_coeff.items()))
+    @staticmethod
+    def rotate_coeffs(floretion: "Floretion", shift: int = 1) -> "Floretion":
+        return _rotate_coeffs(floretion, shift)
 
-        flo_order = self.flo_order
+    @staticmethod
+    def apply_sequence(floretion: "Floretion", methods, iter_index: int | None = None) -> "Floretion":
+        return _apply_sequence(floretion, methods, iter_index)
 
-        for base_vec in self.base_vec_dec_all:
-            # Check if the signs of the products are the same
-            if decomposition_type == "both":
-                if (Floretion.mult_flo_sign_only(base_vec_self, base_vec, flo_order) ==
-                        Floretion.mult_flo_sign_only(base_vec, base_vec_self, flo_order)):
-                    commuting_base_vectors.add(base_vec)
-            elif decomposition_type == "positive" or decomposition_type == "pos":
-                if (Floretion.mult_flo_sign_only(base_vec_self, base_vec, flo_order) > 0 and
-                        Floretion.mult_flo_sign_only(base_vec, base_vec_self, flo_order) > 0):
-                    commuting_base_vectors.add(base_vec)
-            elif decomposition_type == "negative" or decomposition_type == "neg":
-                if (Floretion.mult_flo_sign_only(base_vec_self, base_vec, flo_order) < 0 and
-                        Floretion.mult_flo_sign_only(base_vec, base_vec_self, flo_order) < 0):
-                    commuting_base_vectors.add(base_vec)
-            elif decomposition_type == "mixed_pos" or decomposition_type == "mixpos":
-                if (Floretion.mult_flo_sign_only(base_vec_self, base_vec, flo_order) > 0 and
-                        Floretion.mult_flo_sign_only(base_vec, base_vec_self, flo_order) < 0):
-                    commuting_base_vectors.add(base_vec)
-            elif decomposition_type == "mixed_neg" or decomposition_type == "mixneg":
-                if (Floretion.mult_flo_sign_only(base_vec_self, base_vec, flo_order) > 0 and
-                        Floretion.mult_flo_sign_only(base_vec, base_vec_self, flo_order) < 0):
-                    commuting_base_vectors.add(base_vec)
+    @staticmethod
+    def from_legacy_order2(flo_legacy: str) -> "Floretion":
+        from lib.floretion_utils.helpers import convert_legacy_order2_to_new
 
-        return commuting_base_vectors
+        """Shortcut: converte legacy e costruisce la Floretion nuova."""
+        s = convert_legacy_order2_to_new(flo_legacy)
+        return s
 
 
 if __name__ == "__main__":
-    coeffs = [1, .5, .5, .5, .5, 1, 1, 1, 1]
-    basevecs = [412472, 412722, 412171, 412711, 412777, 121111, 221222, 444244, 177777]
 
-    coeffs = [1, .5, .5, 0.25]
-    basevecs = [412, 112, 414, 111]
+    Em =  Floretion.from_string("ee")
 
-    yo = Floretion(coeffs, basevecs, format_type="oct")
-    print(f"yo {yo.as_floretion_notation()} ")
+    Qua = Floretion.from_string("ie + je ")
+    X = Em * Qua
+    print(X.as_floretion_notation())
+    exit(-1)
 
-    x = Floretion.from_string("1.0ie + 1.0ek + 1.0je")
-    y = Floretion.from_string("1.0kj + 1.0ki +ee")
+    # Esempi / test manuali: usa logging invece di print
+    logging.basicConfig(level=logging.INFO)
+
+    yo = "- 2'i + 2'j - 'k + i' + j' - k' + 2'ii' - 'jj' - 2'kk' + 'ij' + 'ik' + 'ji' + 'jk' - 2'kj' + 2e"
+    yo = ".5'i + .5'ii' + .5'ij' + .5'ike'"
+    yo_new = Floretion.from_legacy_order2(yo)
+    logger.info("yo_new (converted legacy order2): %s", yo_new)
+    yo_flo = Floretion.from_string(yo_new)
+    logger.info("yo_flo as floretion notation: %s", yo_flo.as_floretion_notation())
+    exit(-1)
+
+    flo_x = Floretion([1, 0.5, -0.2], [11, 21, 41], format_type="oct")
+    logger.info("normalized: %s", flo_x.normalize_coeffs().as_floretion_notation())
+
+    x = Floretion.from_string("iijiije+2eeijijj")
+    y = Floretion.from_string("1.5ikkiiii + ijekkkk")
     z = x * y
-    print(f"z {z.as_floretion_notation()} ")
+    logger.info("z %s", z.as_floretion_notation())
 
-    x = Floretion.from_string("1.0jj + 1.0jk + 1.0ji")
-    y = Floretion.from_string("1.0ej+ii+kk")
+    base = Floretion.get_typical_floretions("uniform_flo", 2)
+    logger.info("uniform_flo order 2: %s", base.as_floretion_notation())
+    exit(-1)
+
+    yo_array = np.array([1, 1, 2]) == np.array([1, 0, 1])
+    logger.info("yo_array mask: %s", yo_array)
+    logger.info("masked: %s", np.array([1, 1, 1])[yo_array])
+    exit(-1)
+
+    from lib.floretion_utils.floretion_ops import write_centers_to_file_npy, square_fast
+
+    write_centers_to_file_npy(2, "neg")
+    write_centers_to_file_npy(3, "neg")
+    write_centers_to_file_npy(4, "neg")
+    write_centers_to_file_npy(5, "neg")
+    write_centers_to_file_npy(6, "neg")
+    # write_centers_to_file_npy(7, "pos")
+
+    exit(-1)
+
+    x = Floretion.from_string("iijiije+2eeijijj")
+    y = Floretion.from_string("1.5ikkiiii")
     z = x * y
-    print(f"z {z.as_floretion_notation()} ")
+    logger.info("z %s", z.as_floretion_notation())
+    exit(-1)
 
-    x = Floretion.from_string("ii + ie + ik + ej + ki + ke + kk + ij + ek + ee + ei + kj + ji + je + jk + jj")
-    y = Floretion.from_string("1.0ii+jj+kk")
-    z = x * y
-    print(f"z {z.as_floretion_notation()} ")
+    for order in [4, 5, 6]:
+        base = Floretion.get_typical_floretions("uniform_flo", order)
+        rng = np.random.default_rng(0)
+        mask = rng.random(base.coeff_vec_all.size) < 0.1
+        coeffs = rng.standard_normal(base.coeff_vec_all.size) * mask
+        X = Floretion(coeffs, base.base_vec_dec_all, base.grid_flo_loaded_data)
+        logger.info("start ref (order %d)", order)
+        ref = X * X
+        logger.info("end ref")
+        logger.info("start fast")
+        fast = square_fast(X, use_centers=False)
+        logger.info("end fast")
+        err = np.max(np.abs(ref.coeff_vec_all - fast.coeff_vec_all))
+        logger.info("order %d, max abs err: %s", order, err)
 
-    # TEST CODE ONLY
-    # glider
-    # df = np.array([[1, 1247], [1, 1272], [1, 1217], [1, 1271], [1, 1277]])
+    exit(-1)
 
-    df = np.array([[1, 41247], [1, 41272], [1, 41217], [1, 41271], [1, 41277],
-                   [1, 44247], [1, 44272], [1, 44217], [1, 44271], [1, 44277],
-                   [1, 41444], [1, 42474], [1, 42774]])
-
-    # df = np.array([[1, 44441]])
-    # flo_x = Floretion([1, .5, -.2], [11, 21, 41],  format_type="oct")
-    # flo_y = Floretion([-1], [44], format_type="oct")
-    # print((flo_y).as_floretion_notation())
-
-    flo_x = Floretion.from_string("ii +jj + ek")
-    flo_y = Floretion.from_string("ie")
-
-    commutes_ie = np.array([9, 10, 12, 15, 57, 58, 60, 63])
-    flo_commutes_ie = Floretion(np.ones(commutes_ie.size), commutes_ie, format_type="dec")
-    print(f"flo_commutes_ie {flo_commutes_ie.as_floretion_notation()}")
-
-    print(flo_y.find_center())
-
-    flo_z = flo_x * flo_y
-    # print(f"flo_z {flo_z.as_floretion_notation()}")
-
-    flo_x = Floretion.from_string("ii")
-    flo_x_inv = flo_x.inverse()
-    print(f"flo_x {flo_x.as_floretion_notation()} flo_x_inv {flo_x_inv.as_floretion_notation()}")
-
-    flo_x = Floretion.from_string(".5iii +.5jjj + .5kkk")
-    flo_y = Floretion.from_string("iij +  iik + jji +jjk + kki + kkj")
-
-    flo_z = flo_x * flo_y
-    # print(f"flo_z {flo_z.as_floretion_notation()}")
-
-    flo_x = Floretion.from_string("ijk + iji + iii")
-    flo_y = Floretion.from_string("iik")
-
-    # flo_z = flo_x * flo_y
-    # print(f"flo_z {flo_z.as_floretion_notation()}")
-
-    coeffs = [1]
-
-    flo1 = Floretion(coeffs, [10], format_type="dec")
-    flo2 = Floretion(coeffs, [12], format_type="dec")
-
-    flo3 = flo2 * flo1
-
-    # print(f"flo1 {flo1.as_floretion_notation()}")
-    # print(f"flo2 {flo2.as_floretion_notation()}")
-    # print(f"flo3 {flo3.as_floretion_notation()}")
-
-    flo4 = flo3 * flo3
-    # print(f"flo4 {flo4.as_floretion_notation()}")
-    # flo_c = flo_c*flo_c
-    # print(flo_c.as_floretion_notation())
-    # flo_t = flo_x_squared = flo_c ** 2
-    # print(flo_t.as_floretion_notation())
-    # flo_z = Floretion.from_string("1.0ii-3.0ij+2.0ee")
-
-    # flo_order = 1
-    # grid_flo_data = pd.read_csv(f"./data/grid.flo_{flo_order}.oct.csv", dtype={'oct': str})
-    # c = Floretion.from_preloaded_data([1, 0, 0, 1], [1, 2, 4, 7], flo_order, grid_flo_data)
-    # print(f"2c {c.as_floretion_notation()} ")
-    # c.coeff_vec_all = Floretion.add_sp(c, c)
-    # print(f"2c {c.as_floretion_notation()} ")
-
-    # coeffs = [1]
-    # coords = np.array([22, 7])
-    # coords = np.array([[333, 106]])
-    # coords = np.array([[355, 113]])
-
-    # coeffs = [1]
-    # coords = np.array([[355, 113]])
-    # yo1 = Floretion.from_cartesian_coords(coeffs=coeffs, coords=coords)
-    # coords = np.array([[333, 106]])
-    # yo2 = Floretion.from_cartesian_coords(coeffs=coeffs, coords=coords)
-    # z = yo1*yo2
-    # print(f"yo1 {yo1.as_floretion_notation()} yo2 {yo2.as_floretion_notation()} z {z.as_floretion_notation()}")
-
-    # flo_x = Floretion.from_string("eeeeeikkj")
-    # flo_y = Floretion.from_string("eikjikeje")
-    # flo_x = Floretion.from_string("eeeeeikkj")
-    # flo_y = Floretion.from_string("eikjikeje")
-    # flo_z = flo_x * flo_y
-    # print(f"flo_x {flo_x.as_floretion_notation()} flo_y {flo_y.as_floretion_notation()} "
-    #      f"flo_x*flo_y = {(flo_z).as_floretion_notation()} dec_x: {flo_x.base_to_nonzero_coeff} "
-    #      f"dec_y: {flo_y.base_to_nonzero_coeff}"
-    #      f"dec_z: {flo_z.base_to_nonzero_coeff} ")
-
-    # f"grid coords {Floretion.flo_oct_to_grid(flo_z.base_to_nonzero_coeff)}" )
-# flo = Floretion.from_cartesian_coords(coeffs=coeffs, coords=coords, flo_order=-1)
-# print(f"flo {flo.as_floretion_notation()} ")
-
-# c = Floretion.from_string("-2i-2.0e")
-# print(c.as_floretion_notation())
-# c.coeff_vec_all = Floretion.add_sp(c,c)
-# print(c.as_floretion_notation())
-# yo_instance.coeff_vec_all = Floretion.add_sp(yo_instance, yo_instance)
-# yo_instance.coeff_vec_all = Floretion.mul_sp(yo_instance, yo_instance)
-# print(f"yo {yo_instance.as_floretion_notation()} sum_of_squares {yo_instance.sum_of_squares()}")
-
-# print(flo_z.as_floretion_notation())
-# flo_z = flo_z*flo_z
-# print((flo_x-flo_x).as_floretion_notation())
-# print(flo_z.as_floretion_notation())
-# print(flo_z.base_to_nonzero_coeff)
-# print(flo_z.base_to_grid_index)
-
-# floretion_obj.display_as_grid2()
-# floretion_obj.display_as_grid()
-# floretion_obj.conway(0)
-# floretion_obj.conway(1000)
-# df = np.array([[0.5, 137], [1, 138]])
-# floretion_obj = floret_ion(df, "dec")
-# print(floretion_obj.as_floretion_notation())
-
+    x = Floretion.from_string("iiiiijii+2ejijijji")
+    y = Floretion.from_string("1.5ijkiijiiikkiijkjk")
+    # z = x * y
+    logger.info("x: %s", x.as_floretion_notation())
+    logger.info("y: %s", y.as_floretion_notation())
+    logger.info("z: %s ...", z.as_floretion_notation()[:120])
+    logger.info("index(4684): %s", Floretion.get_basevec_index(4684, "dec"))
+    logger.info("index(11114): %s", Floretion.get_basevec_index("11114", "oct"))
